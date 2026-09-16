@@ -1498,14 +1498,14 @@ button {
   transform: rotate(-90deg);
 }
 
-.background-ring.spinning {
-  animation: ring-spin 1.6s linear infinite;
-}
-
 .background-ring .ring-track {
   fill: none;
   stroke: #e5e2dc;
   stroke-width: 2.5;
+}
+
+.background-ring.unmeasured .ring-track {
+  stroke: #ece9e3;
 }
 
 .background-ring .ring-value {
@@ -1514,6 +1514,12 @@ button {
   stroke-width: 2.5;
   stroke-linecap: round;
   transition: stroke-dashoffset 0.4s ease;
+}
+
+.background-ring .ring-pulse {
+  fill: #b8926a;
+  transform-origin: 11px 11px;
+  animation: ring-breathe 1.8s ease-in-out infinite;
 }
 
 .background-item-body {
@@ -1566,18 +1572,9 @@ button {
   transition: width 0.4s ease;
 }
 
-.background-bar span.indeterminate {
-  width: 35%;
-  animation: bar-drift 1.8s ease-in-out infinite;
-}
-
-@keyframes ring-spin {
-  to { transform: rotate(360deg); }
-}
-
-@keyframes bar-drift {
-  0% { transform: translateX(-100%); }
-  100% { transform: translateX(320%); }
+@keyframes ring-breathe {
+  0%, 100% { transform: scale(0.62); opacity: .45; }
+  50% { transform: scale(1); opacity: 1; }
 }
 
 .conversation {

@@ -583,24 +583,35 @@ function parseSlashInput(text) {
   return { name: body.slice(0, space), input: body.slice(space + 1).trim() }
 }
 
-// A donut that fills clockwise. With no percentage to show it spins slowly instead, so the
-// row still reads as alive rather than stalled.
+// Only draws an arc when a real percentage exists, because a partly filled donut reads as
+// "this much is done". With nothing to report it shows a breathing dot instead of faking one.
 function Ring({ percent }) {
   const radius = 9
   const circumference = 2 * Math.PI * radius
   const known = typeof percent === 'number'
-  const offset = known ? circumference * (1 - Math.min(Math.max(percent, 0), 100) / 100) : circumference * 0.7
+  const value = known ? Math.min(Math.max(percent, 0), 100) : 0
   return (
-    <svg className={`background-ring ${known ? '' : 'spinning'}`} viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
+    <svg
+      className={`background-ring ${known ? 'measured' : 'unmeasured'}`}
+      viewBox="0 0 22 22"
+      width="22"
+      height="22"
+      role="img"
+      aria-label={known ? `${Math.round(value)} percent complete` : 'Running, duration unknown'}
+    >
       <circle className="ring-track" cx="11" cy="11" r={radius} />
-      <circle
-        className="ring-value"
-        cx="11"
-        cy="11"
-        r={radius}
-        strokeDasharray={circumference}
-        strokeDashoffset={offset}
-      />
+      {known ? (
+        <circle
+          className="ring-value"
+          cx="11"
+          cy="11"
+          r={radius}
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference * (1 - value / 100)}
+        />
+      ) : (
+        <circle className="ring-pulse" cx="11" cy="11" r="3" />
+      )}
     </svg>
   )
 }
@@ -2796,22 +2807,21 @@ function App() {
                     <div className="background-item-body">
                       <strong title={agent.name}>{agent.name}</strong>
                       <div className="background-item-meta" key={tick}>
-                        {percent === null
-                          ? <span>{elapsedLabel(agent.startedAt)}</span>
-                          : <span className="background-percent">{percent}%</span>}
-                        <span className="background-dot-sep">·</span>
-                        <span>
-                          {probe?.eta
-                            ? `${probe.eta} left`
-                            : (percent === null ? 'still working' : elapsedLabel(agent.startedAt))}
-                        </span>
+                        {percent === null ? (
+                          <span>Running for {elapsedLabel(agent.startedAt)}</span>
+                        ) : (
+                          <>
+                            <span className="background-percent">{percent}%</span>
+                            <span className="background-dot-sep">·</span>
+                            <span>{probe?.eta ? `${probe.eta} left` : elapsedLabel(agent.startedAt)}</span>
+                          </>
+                        )}
                       </div>
-                      <div className="background-bar">
-                        <span
-                          className={percent === null ? 'indeterminate' : ''}
-                          style={percent === null ? undefined : { width: `${percent}%` }}
-                        />
-                      </div>
+                      {percent !== null && (
+                        <div className="background-bar">
+                          <span style={{ width: `${percent}%` }} />
+                        </div>
+                      )}
                     </div>
                   </div>
                 )
