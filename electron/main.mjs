@@ -66,6 +66,8 @@ const PREVIEWS_DIRECTORY = path.join(app.getPath('temp'), 'hc-copilot-previews')
 const DEFAULT_BOUNDS = { width: 1360, height: 880 }
 const MIN_WINDOW_WIDTH = 940
 const MIN_WINDOW_HEIGHT = 650
+// How long a tidy shutdown gets before the app stops waiting and quits anyway.
+const QUIT_TIMEOUT_MS = 4000
 
 function appendLog(message) {
   try {
@@ -449,14 +451,11 @@ function parseProgress(tail) {
   return { percent: null, eta: '', line: lines[lines.length - 1] || '' }
 }
 
-async function probeDetachedShell(shellId) {
+// The listing is passed in rather than read here. Polling happens every few seconds for every
+// running command at once, and the shared temp directory holds hundreds of unrelated files, so
+// reading it once per command turned a routine poll into two dozen full directory scans.
+async function probeDetachedShell(shellId, entries) {
   const directory = app.getPath('temp')
-  let entries = []
-  try {
-    entries = await readdir(directory)
-  } catch {
-    return null
-  }
 
   // Names look like copilot-detached-<shellId>-<epochMs>-<uuid>.log. Matching on the plain
   // prefix would let "training" swallow "training-resume", so the timestamp anchors the id.
@@ -488,6 +487,13 @@ async function probeDetachedShell(shellId) {
       const buffer = Buffer.alloc(length)
       await handle.read(buffer, 0, length, size - length)
       tail = buffer.toString('utf8')
+      // Reading a fixed number of bytes from the end can land mid-character, which decodes to a
+      // replacement character. Everything before the first newline is a partial line anyway, so
+      // dropping it removes the damage and costs nothing.
+      if (length < size) {
+        const firstBreak = tail.indexOf('\n')
+        tail = firstBreak === -1 ? '' : tail.slice(firstBreak + 1)
+      }
     } finally {
       await handle.close()
     }
@@ -502,7 +508,16 @@ async function probeDetachedShell(shellId) {
 ipcMain.handle('copilot:probe-background', async (_event, shellIds) => {
   try {
     const list = Array.isArray(shellIds) ? shellIds.filter(Boolean).slice(0, 24) : []
-    const probes = await Promise.all(list.map((id) => probeDetachedShell(id).catch(() => null)))
+    if (!list.length) return { ok: true, report: {} }
+
+    let entries = []
+    try {
+      entries = await readdir(app.getPath('temp'))
+    } catch {
+      return { ok: true, report: {} }
+    }
+
+    const probes = await Promise.all(list.map((id) => probeDetachedShell(id, entries).catch(() => null)))
     const report = {}
     probes.forEach((probe, index) => {
       if (probe) report[list[index]] = probe
@@ -1198,12 +1213,24 @@ app.on('before-quit', async (event) => {
   event.preventDefault()
   const currentClient = client
   client = undefined
-  for (const { session, unsubscribe } of activeSessions.values()) {
-    unsubscribe()
-    await session.disconnect().catch(() => {})
-  }
+
+  // Quitting must not depend on the runtime answering. Sessions were being disconnected one
+  // after another with nothing to stop a single hung one from holding the whole app open, so
+  // Cmd+Q looked like it had been ignored. Shutdown is tidy when it can be and prompt regardless.
+  const forceExit = setTimeout(() => {
+    appendLog('shutdown took too long, quitting anyway')
+    app.exit(0)
+  }, QUIT_TIMEOUT_MS)
+  forceExit.unref?.()
+
+  const sessions = [...activeSessions.values()]
   activeSessions.clear()
+  await Promise.all(sessions.map(({ session, unsubscribe }) => {
+    unsubscribe()
+    return session.disconnect().catch(() => {})
+  }))
   await currentClient.stop().catch((e) => appendLog(`copilot client stop failed: ${e?.message || String(e)}`))
+  clearTimeout(forceExit)
   appendLog('copilot client stopped, quitting')
   app.exit(0)
 })
