@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
@@ -24,14 +24,15 @@ import {
   Square,
   TerminalSquare,
   Trash2,
+  Play,
+  Workflow,
   X,
 } from 'lucide-react'
 import './App.css'
 
-const EMPTY_SESSION_STATE = { working: false, liveText: '', toolActivity: [] }
+const EMPTY_SESSION_STATE = { working: false, liveText: '', toolActivity: [], backgroundAgents: [] }
 const EMPTY_QUEUE = []
 const EMPTY_EDITS = Object.freeze({ hidden: [], manual: [], labels: {} })
-const RAIL_PREVIEW_COUNT = 4
 const PROJECT_PREVIEW_COUNT = 8
 const ERROR_DISMISS_MS = 8000
 
@@ -264,13 +265,49 @@ function groupByFolder(items, workingDirectory) {
   return [...kept, ...groups.filter((group) => !existing.has(group.value))]
 }
 
-function kindLabel(item) {
-  if (item.kind === 'github') return 'GitHub'
-  if (item.kind === 'notion') return 'Notion'
-  if (item.kind === 'figma') return 'Figma'
-  if (item.kind === 'file') return 'File'
-  if (item.kind === 'folder') return 'Folder'
+const KIND_ORDER = ['folder', 'github', 'notion', 'figma', 'file', 'link']
+
+function kindLabel(kind) {
+  if (kind === 'github') return 'GitHub'
+  if (kind === 'notion') return 'Notion'
+  if (kind === 'figma') return 'Figma'
+  if (kind === 'file') return 'File'
+  if (kind === 'folder') return 'Folder'
   return 'Link'
+}
+
+// Within a kind, the canonical target beats a deep link into it.
+function specificityPenalty(item) {
+  if (item.kind === 'github') {
+    if (item.source === 'Repository') return 0
+    if (item.source === 'GitHub profile') return 2
+    return 1
+  }
+  if (item.kind === 'folder') return item.root ? 0 : 1
+  return 0
+}
+
+// One link per kind is the point: this is a way back to the thing, not an index.
+function pickPrimary(items) {
+  const byKind = new Map()
+  items.forEach((item) => {
+    const bucket = byKind.get(item.kind)
+    if (bucket) bucket.push(item)
+    else byKind.set(item.kind, [item])
+  })
+
+  return KIND_ORDER.filter((kind) => byKind.has(kind)).map((kind) => {
+    const bucket = byKind.get(kind).slice().sort((a, b) => {
+      const manual = Number(Boolean(b.manual)) - Number(Boolean(a.manual))
+      if (manual) return manual
+      const specificity = specificityPenalty(a) - specificityPenalty(b)
+      if (specificity) return specificity
+      if (b.count !== a.count) return b.count - a.count
+      return b.order - a.order
+    })
+    const [primary, ...alternates] = bucket
+    return { ...primary, alternates }
+  })
 }
 
 // Resources are read back out of the transcript, so nothing extra has to be stored per turn.
@@ -320,6 +357,14 @@ function collectResources(messages, workingDirectory) {
     })
   }
   return list
+}
+
+function elapsedLabel(startedAt) {
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 
 function displayTime(value) {
@@ -460,8 +505,14 @@ function openExternalLink(event, href) {
   window.copilot?.openExternal(href)
 }
 
+const RUNNABLE_LANGUAGES = new Set(['bash', 'sh', 'shell', 'zsh', 'console', 'terminal'])
+const RunCommandContext = createContext(null)
+
 function CodeBlock({ language, code }) {
   const [copied, setCopied] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const runCommand = useContext(RunCommandContext)
+  const runnable = Boolean(runCommand) && RUNNABLE_LANGUAGES.has((language || '').toLowerCase()) && code.trim()
 
   const copy = () => {
     navigator.clipboard?.writeText(code).then(() => {
@@ -470,10 +521,27 @@ function CodeBlock({ language, code }) {
     }).catch(() => {})
   }
 
+  const confirmRun = () => {
+    setConfirming(false)
+    runCommand(code)
+  }
+
   return (
     <div className="code-block">
       <div className="code-block-head">
         <span>{language || 'code'}</span>
+        {runnable && !confirming && (
+          <button type="button" className="code-run" onClick={() => setConfirming(true)}>
+            <Play size={11} /> Run
+          </button>
+        )}
+        {runnable && confirming && (
+          <span className="code-run-confirm">
+            Run this?
+            <button type="button" className="code-run-yes" onClick={confirmRun}>Run</button>
+            <button type="button" onClick={() => setConfirming(false)}>Cancel</button>
+          </span>
+        )}
         <button type="button" onClick={copy}>
           {copied ? <Check size={12} /> : <Copy size={12} />}
           {copied ? 'Copied' : 'Copy'}
@@ -586,6 +654,8 @@ function App() {
   const [selectedModel, setSelectedModel] = useState('auto')
   const [messages, setMessages] = useState([])
   const [sessionState, setSessionState] = useState({})
+  const [backgroundPanelFor, setBackgroundPanelFor] = useState(null)
+  const [tick, setTick] = useState(0)
   const [quota, setQuota] = useState(null)
   const [capabilities, setCapabilities] = useState(null)
   const [knowledge, setKnowledge] = useState([])
@@ -752,7 +822,18 @@ function App() {
   const quotaSnapshot = quota?.premium_interactions || quota?.chat || null
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
+  const backgroundAgents = liveState.backgroundAgents
   const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
+
+  // Only tick while background work exists, so an idle app does no per-second work.
+  useEffect(() => {
+    if (!backgroundAgents.length) return undefined
+    const timer = setInterval(() => setTick((value) => value + 1), 1000)
+    return () => clearInterval(timer)
+  }, [backgroundAgents.length])
+
+  // Derived from the owning session, so switching sessions closes the panel without an effect.
+  const backgroundPanelOpen = backgroundPanelFor === selectedId && backgroundAgents.length > 0
 
   const sessionEdits = useMemo(
     () => (selectedId && resourceEdits[selectedId]) || EMPTY_EDITS,
@@ -761,18 +842,20 @@ function App() {
   const resources = useMemo(() => {
     const detected = collectResources(messages, selectedWorkingDirectory)
     const hidden = new Set(sessionEdits.hidden || [])
-    const manual = (sessionEdits.manual || []).map((item) => ({ ...item, manual: true, count: 1 }))
+    const manual = (sessionEdits.manual || []).map((item, index) => ({
+      ...item,
+      manual: true,
+      count: 1,
+      order: index,
+    }))
     const manualValues = new Set(manual.map((item) => item.value))
     const merged = [
       ...manual,
       ...detected.filter((item) => !manualValues.has(item.value)),
-    ].filter((item) => !hidden.has(item.value))
-    const roots = merged.filter((item) => item.root)
-    const rest = merged.filter((item) => !item.root)
-    return [...roots, ...rest].map((item) => ({
-      ...item,
-      label: sessionEdits.labels?.[item.value] || item.label,
-    }))
+    ]
+      .filter((item) => !hidden.has(item.value))
+      .map((item) => ({ ...item, label: sessionEdits.labels?.[item.value] || item.label }))
+    return pickPrimary(merged)
   }, [messages, selectedWorkingDirectory, sessionEdits])
 
   const patchSessionState = useCallback((sessionId, patch) => {
@@ -1006,8 +1089,30 @@ function App() {
           )),
         }))
       }
+      if (event.type === 'subagent.started' && event.data?.executionMode === 'background') {
+        patchSessionState(sessionId, (current) => {
+          const id = event.data?.toolCallId
+          if (!id || current.backgroundAgents.some((item) => item.id === id)) return current
+          return {
+            ...current,
+            backgroundAgents: [...current.backgroundAgents, {
+              id,
+              name: event.data?.agentDisplayName || event.data?.agentName || 'Background agent',
+              description: event.data?.agentDescription || '',
+              model: event.data?.model || '',
+              startedAt: Date.now(),
+            }],
+          }
+        })
+      }
+      if (event.type === 'subagent.completed' || event.type === 'subagent.failed') {
+        patchSessionState(sessionId, (current) => ({
+          ...current,
+          backgroundAgents: current.backgroundAgents.filter((item) => item.id !== event.data?.toolCallId),
+        }))
+      }
       if (event.type === 'session.idle') {
-        patchSessionState(sessionId, { liveText: '', toolActivity: [] })
+        patchSessionState(sessionId, { liveText: '', toolActivity: [], backgroundAgents: [] })
         // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
         if (!drainQueueRef.current(sessionId)) {
           patchSessionState(sessionId, { working: false })
@@ -1017,7 +1122,7 @@ function App() {
         }).catch((e) => showError(e?.message || String(e)))
       }
       if (event.type === 'session.error') {
-        patchSessionState(sessionId, { working: false })
+        patchSessionState(sessionId, { working: false, backgroundAgents: [] })
         queuesRef.current = Object.fromEntries(
           Object.entries(queuesRef.current).filter(([key]) => key !== sessionId),
         )
@@ -1409,6 +1514,23 @@ function App() {
     setRailDraft(null)
   }
 
+  const runCommandFromBlock = useCallback((code) => {
+    const command = code.trim()
+    if (!command || !selectedId) return
+    const prompt = `Run this in the terminal and show me the output:\n\n\`\`\`bash\n${command}\n\`\`\``
+    setError(null)
+    // Queue instead of dropping the command when the session is mid-turn.
+    if (sessionState[selectedId]?.working) {
+      writeQueue(selectedId, (items) => [...items, {
+        id: crypto.randomUUID(),
+        prompt,
+        attachments: [],
+      }])
+      return
+    }
+    deliverMessage(selectedId, prompt, [])
+  }, [deliverMessage, selectedId, sessionState, writeQueue])
+
   const sendMessage = () => {
     const typedPrompt = message.trim()
     if ((!typedPrompt && !attachments.length) || !selectedId) return
@@ -1441,7 +1563,7 @@ function App() {
       return
     }
     writeQueue(selectedId, [])
-    patchSessionState(selectedId, { working: false, liveText: '', toolActivity: [] })
+    patchSessionState(selectedId, { working: false, liveText: '', toolActivity: [], backgroundAgents: [] })
   }
 
   const forkSession = async (session) => {
@@ -1551,6 +1673,7 @@ function App() {
   }
 
   const sessionIsWorking = (sessionId) => Boolean(sessionState[sessionId]?.working)
+  const sessionHasBackgroundAgents = (sessionId) => (sessionState[sessionId]?.backgroundAgents?.length || 0) > 0
   const sessionNeedsAnswer = (sessionId) => permissions.some((item) => item.sessionId === sessionId)
 
   const openRowMenu = (session, x, y) => {
@@ -1587,7 +1710,11 @@ function App() {
         </div>
       ) : (
         <button className="session-main" onClick={() => openSession(session.id)}>
-          <span className="session-dot" aria-hidden="true" />
+          <span
+            className={`session-dot ${sessionHasBackgroundAgents(session.id) ? 'running' : ''}`}
+            title={sessionHasBackgroundAgents(session.id) ? 'Background work running' : undefined}
+            aria-hidden="true"
+          />
           <span className="session-copy">
             <strong>{aliases[session.id] || session.title}</strong>
           </span>
@@ -1817,6 +1944,7 @@ function App() {
       </div>
 
       <section className="workspace">
+       <RunCommandContext.Provider value={runCommandFromBlock}>
         <header className="topbar">
           <div className="session-title">
             <span className="session-title-icon"><TerminalSquare size={16} /></span>
@@ -1920,7 +2048,7 @@ function App() {
           <div className={`resource-rail ${railOpen ? 'open' : ''}`}>
             <div className="rail-strip">
               <div className="rail-chips">
-                {(railOpen ? [] : resources.slice(0, RAIL_PREVIEW_COUNT)).map((item) => (
+                {(railOpen ? [] : resources).map((item) => (
                   <button
                     type="button"
                     key={item.id}
@@ -1930,15 +2058,11 @@ function App() {
                       event.preventDefault()
                       setRailMenu({ item, x: event.clientX, y: event.clientY })
                     }}
-                    title={`${item.source} · ${item.value}`}
+                    title={`${item.label} · ${item.value}`}
                   >
-                    <span className={`rail-tag kind-${item.kind}`}>{kindLabel(item)}</span>
-                    <span className="rail-chip-label">{item.label}</span>
+                    <span className={`rail-tag kind-${item.kind}`}>{kindLabel(item.kind)}</span>
                   </button>
                 ))}
-                {!railOpen && resources.length > RAIL_PREVIEW_COUNT && (
-                  <span className="rail-more">+{resources.length - RAIL_PREVIEW_COUNT}</span>
-                )}
                 {railOpen && <span className="rail-heading">Resources in this session</span>}
               </div>
               <button
@@ -1955,35 +2079,69 @@ function App() {
             {railOpen && (
               <div className="rail-panel">
                 {resources.map((item) => (
-                  <div className="rail-row" key={item.id}>
-                    <span className={`rail-dot kind-${item.kind}`} />
-                    <button
-                      type="button"
-                      className="rail-row-label"
-                      onClick={() => openResource(item)}
-                      title={item.value}
-                    >
-                      {item.label}
-                    </button>
-                    <span className="rail-source">{item.source}</span>
-                    <button
-                      type="button"
-                      className="rail-row-action"
-                      onClick={() => insertResource(item)}
-                      title="Add to your message"
-                      aria-label={`Add ${item.label} to your message`}
-                    >
-                      <Plus size={13} />
-                    </button>
-                    <button
-                      type="button"
-                      className="rail-row-action"
-                      onClick={(event) => setRailMenu({ item, x: event.clientX, y: event.clientY })}
-                      title="More"
-                      aria-label={`More options for ${item.label}`}
-                    >
-                      <MoreHorizontal size={13} />
-                    </button>
+                  <div className="rail-group" key={item.id}>
+                    <div className="rail-row">
+                      <span className={`rail-tag kind-${item.kind}`}>{kindLabel(item.kind)}</span>
+                      <button
+                        type="button"
+                        className="rail-row-label"
+                        onClick={() => openResource(item)}
+                        title={item.value}
+                      >
+                        {item.label}
+                      </button>
+                      <span className="rail-source">{item.source}</span>
+                      <button
+                        type="button"
+                        className="rail-row-action"
+                        onClick={() => insertResource(item)}
+                        title="Add to your message"
+                        aria-label={`Add ${item.label} to your message`}
+                      >
+                        <Plus size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        className="rail-row-action"
+                        onClick={(event) => setRailMenu({ item, x: event.clientX, y: event.clientY })}
+                        title="More"
+                        aria-label={`More options for ${item.label}`}
+                      >
+                        <MoreHorizontal size={13} />
+                      </button>
+                    </div>
+                    {item.alternates?.map((alternate) => (
+                      <div className="rail-row alternate" key={alternate.id}>
+                        <span className="rail-tag placeholder" />
+                        <button
+                          type="button"
+                          className="rail-row-label"
+                          onClick={() => openResource(alternate)}
+                          title={alternate.value}
+                        >
+                          {alternate.label}
+                        </button>
+                        <span className="rail-source">{alternate.source}</span>
+                        <button
+                          type="button"
+                          className="rail-row-action"
+                          onClick={() => insertResource(alternate)}
+                          title="Add to your message"
+                          aria-label={`Add ${alternate.label} to your message`}
+                        >
+                          <Plus size={13} />
+                        </button>
+                        <button
+                          type="button"
+                          className="rail-row-action"
+                          onClick={(event) => setRailMenu({ item: alternate, x: event.clientX, y: event.clientY })}
+                          title="More"
+                          aria-label={`More options for ${alternate.label}`}
+                        >
+                          <MoreHorizontal size={13} />
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 ))}
                 {!resources.length && (
@@ -2067,6 +2225,42 @@ function App() {
             <AlertTriangle size={14} />
             <span>{error.message}</span>
             <button onClick={() => setError(null)}><X size={13} /></button>
+          </div>
+        )}
+
+        {backgroundAgents.length > 0 && (
+          <div className="background-float">
+            <button
+              type="button"
+              className={`background-toggle ${backgroundPanelOpen ? 'open' : ''}`}
+              onClick={() => setBackgroundPanelFor(backgroundPanelOpen ? null : selectedId)}
+              title={`${backgroundAgents.length} background agent${backgroundAgents.length > 1 ? 's' : ''} running`}
+              aria-expanded={backgroundPanelOpen}
+            >
+              <span className="background-pulse" aria-hidden="true" />
+              <Workflow size={13} />
+              {backgroundAgents.length}
+            </button>
+            {backgroundPanelOpen && (
+              <div className="background-panel">
+                <div className="background-panel-head">
+                  Running in the background
+                  <button type="button" onClick={() => setBackgroundPanelFor(null)} aria-label="Close">
+                    <X size={12} />
+                  </button>
+                </div>
+                {backgroundAgents.map((agent) => (
+                  <div className="background-item" key={agent.id}>
+                    <div className="background-item-head">
+                      <strong>{agent.name}</strong>
+                      <small key={tick}>{elapsedLabel(agent.startedAt)}</small>
+                    </div>
+                    {agent.description && <p>{agent.description}</p>}
+                    {agent.model && <span className="background-model">{agent.model}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -2260,6 +2454,7 @@ function App() {
             </div>
           </div>
         )}
+       </RunCommandContext.Provider>
       </section>
 
       {activePermission && (

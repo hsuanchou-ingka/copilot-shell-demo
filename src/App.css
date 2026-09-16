@@ -676,6 +676,12 @@ button {
   border-color: #6f6b63;
 }
 
+.session-dot.running {
+  border-color: #8b60af;
+  background: #8b60af;
+  animation: dot-blink 1.4s ease-in-out infinite;
+}
+
 .session-copy {
   min-width: 0;
 }
@@ -874,39 +880,38 @@ button {
 }
 
 .rail-chip {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 215px;
+  flex: none;
   height: 23px;
-  padding: 0 10px 0 7px;
+  padding: 0 4px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  border: 1px solid #e0ddd6;
-  border-radius: 20px;
-  background: #fff;
-  color: #55524c;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
   cursor: pointer;
-  font-size: 11.5px;
-  font-weight: 550;
 }
 
 .rail-chip:hover {
-  border-color: #c4c0b8;
-  color: #2b2721;
+  border-color: #dbd7cf;
+  background: #fff;
 }
 
 .rail-tag {
   flex: none;
-  padding: 2px 5px;
+  padding: 3px 6px;
   border-radius: 4px;
   background: #ebe8e1;
   color: #6f6b63;
-  font-size: 8.5px;
+  font-size: 9px;
   font-weight: 750;
-  letter-spacing: .05em;
+  letter-spacing: .06em;
   line-height: 1;
   text-transform: uppercase;
+}
+
+.rail-tag.placeholder {
+  background: transparent;
+  visibility: hidden;
 }
 
 .rail-tag.kind-github { background: #ecebfa; color: #5450bd; }
@@ -914,6 +919,15 @@ button {
 .rail-tag.kind-figma { background: #fae7e0; color: #b4522f; }
 .rail-tag.kind-folder { background: #f7ebd3; color: #8f6a17; }
 .rail-tag.kind-file { background: #e2f0e7; color: #3f7a5c; }
+
+.rail-group + .rail-group {
+  margin-top: 2px;
+}
+
+.rail-row.alternate .rail-row-label {
+  color: #7d786f;
+  font-weight: 450;
+}
 
 .rail-chip-label {
   overflow: hidden;
@@ -1359,6 +1373,125 @@ button {
   font-weight: 700;
 }
 
+.background-float {
+  position: absolute;
+  top: 72px;
+  right: 20px;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.background-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid #ddd8ce;
+  border-radius: 999px;
+  background: #fffdf9;
+  color: #2b2721;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(43, 39, 33, .08);
+}
+
+.background-toggle:hover,
+.background-toggle.open {
+  border-color: #b293d0;
+}
+
+.background-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #8b60af;
+  animation: dot-blink 1.4s ease-in-out infinite;
+}
+
+.background-panel {
+  width: 272px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid #ddd8ce;
+  border-radius: 10px;
+  background: #fffdf9;
+  box-shadow: 0 6px 20px rgba(43, 39, 33, .12);
+}
+
+.background-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  color: #6f6b63;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.background-panel-head button {
+  display: flex;
+  padding: 2px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: #6f6b63;
+  cursor: pointer;
+}
+
+.background-panel-head button:hover {
+  background: #efeae0;
+}
+
+.background-item {
+  padding: 7px 8px;
+  border-radius: 7px;
+}
+
+.background-item:hover {
+  background: #f7f4ee;
+}
+
+.background-item-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.background-item-head strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.background-item-head small {
+  flex-shrink: 0;
+  color: #6f6b63;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.background-item p {
+  margin: 2px 0 0;
+  color: #6f6b63;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.background-model {
+  display: inline-block;
+  margin-top: 4px;
+  color: #8a857c;
+  font-size: 10.5px;
+}
+
 .conversation {
   position: relative;
   min-height: 0;
@@ -1751,7 +1884,7 @@ button {
   padding: 0 7px 0 11px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 6px;
   border-bottom: 1px solid #e5e2dc;
   background: #f1f0ec;
   color: #817d75;
@@ -1759,6 +1892,40 @@ button {
   font-size: 11px;
   font-weight: 650;
   letter-spacing: .03em;
+}
+
+.code-block-head > span:first-child {
+  margin-right: auto;
+}
+
+.code-block-head .code-run {
+  border-color: #c9bcd8;
+  color: #6c4b8a;
+}
+
+.code-block-head .code-run:hover {
+  background: #f3edf8;
+  border-color: #b293d0;
+}
+
+.code-run-confirm {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #6c4b8a;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.code-block-head .code-run-yes {
+  border-color: #b293d0;
+  background: #8b60af;
+  color: #fff;
+}
+
+.code-block-head .code-run-yes:hover {
+  background: #7a529b;
 }
 
 .code-block-head button {
@@ -2595,6 +2762,11 @@ button {
 
 .spin {
   animation: spin .9s linear infinite;
+}
+
+@keyframes dot-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .25; }
 }
 
 @keyframes pulse {
