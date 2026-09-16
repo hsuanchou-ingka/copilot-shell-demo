@@ -1500,6 +1500,11 @@ function App() {
 
   const openSession = useCallback((sessionId) => {
     if (!sessionId) return
+    if (sessionId === selectedIdRef.current) {
+      setSessionMenuOpen(false)
+      setEditingSession(false)
+      return
+    }
     setMessages([])
     setLoadingSession(true)
     resetScroll()

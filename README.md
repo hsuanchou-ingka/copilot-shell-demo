@@ -4,11 +4,6 @@ A desktop client for GitHub Copilot CLI, built for people who run more than one 
 
 Copilot CLI is excellent, but it gives you one conversation in one terminal tab. When you are researching in one thread, refactoring in another, and waiting on a long build in a third, tabs stop being a good way to hold that. This app keeps every session in one window, shows you which ones are working and which ones are waiting on you, and lets you move between them without losing your place.
 
-<!-- Add your screenshot here -->
-<p align="center">
-  <img src="docs/screenshots/overview.png" alt="Session list on the left, conversation on the right" width="900">
-</p>
-
 ## Why it exists
 
 I am a designer, not a backend engineer. I use Copilot CLI daily for design tooling, prototypes, and document work, and I kept hitting the same three problems:
@@ -33,19 +28,15 @@ So I built the interface I wanted. Everything here exists because it solved one 
 
 **Attach files and images.** Use the file picker, or paste an image straight from the clipboard.
 
+**Type ahead while a turn is running.** You do not have to wait for an answer before writing the next message. Anything you send while the session is busy joins a queue and goes out as soon as the turn finishes, in the order you wrote it.
+
+**Find your way back to the things a session touched.** A rail under the header collects the folders, repositories, Notion pages and Figma files that came up in the conversation, and keeps one entry per kind so it stays a shortcut rather than an index. You can rename, hide or add entries by hand.
+
+**Preview what gets generated.** HTML, SVG and Mermaid blocks render in a resizable panel next to the conversation, with reload, copy, and open in browser. Runtime errors inside the preview are reported back instead of failing silently.
+
+**Keep an eye on long jobs.** Commands you leave running in the background appear in their own list with a progress ring and an estimated finish time, read from the output of tools that report progress.
+
 **Watch your quota.** Premium request usage is shown in the footer, so you know where you stand before starting something expensive.
-
-## Screenshots
-
-<!-- Replace these with your own captures -->
-
-| Multiple sessions | Permission request |
-|---|---|
-| ![Sessions](docs/screenshots/sessions.png) | ![Permission](docs/screenshots/permission.png) |
-
-| Project grouping | Session options |
-|---|---|
-| ![Projects](docs/screenshots/projects.png) | ![Options](docs/screenshots/options.png) |
 
 ## Requirements
 
