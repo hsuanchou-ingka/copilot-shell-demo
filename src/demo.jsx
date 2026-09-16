@@ -193,6 +193,21 @@ const SCENES = {
     window.setTimeout(() => document.querySelector('.plan-hud-head')?.click(), 500)
   },
 
+  // Sending without emitting a reply leaves the turn open with nothing streamed yet, which is
+  // the state this is about. The quiet styling needs ninety seconds of silence to arrive on its
+  // own, so for a still image it is dressed on the live element rather than waited for.
+  quiet() {
+    const box = document.querySelector('.composer textarea')
+    typeInto(box, 'Check every semantic token against the naming rules')
+    pressEnter(box)
+    window.setTimeout(() => {
+      const node = document.querySelector('.thinking')
+      if (!node) return
+      node.classList.add('quiet')
+      node.lastChild.textContent = 'Working, quiet for 2m 30s'
+    }, 700)
+  },
+
   permission() {
     ask({
       requestId: 'r1',

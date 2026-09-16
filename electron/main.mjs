@@ -643,6 +643,26 @@ ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attac
   }
 })
 
+// The live event stream is what makes the UI feel immediate, but it is not a source of truth:
+// a dropped end-of-turn event used to leave the spinner running forever with no way back.
+// The transcript on disk is the truth, so this exists to go and ask.
+//
+// Note the transcript is a filtered record, not the raw stream. It keeps user.message and
+// assistant.turn_end but not session.idle, so the turn boundary has to be read from turn_end.
+// A turn is still running when the last user message comes after the last boundary.
+ipcMain.handle('copilot:session-busy', async (_event, sessionId) => {
+  try {
+    const session = await resumeSession(sessionId)
+    const types = (await session.getEvents()).map((event) => event.type)
+    const lastUser = types.lastIndexOf('user.message')
+    // session.start counts as a boundary so a chat that has never been used reads as idle.
+    const lastBoundary = Math.max(types.lastIndexOf('assistant.turn_end'), types.lastIndexOf('session.start'))
+    return { ok: true, busy: lastUser > lastBoundary }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 ipcMain.handle('copilot:read-todos', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)

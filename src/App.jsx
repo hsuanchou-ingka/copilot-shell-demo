@@ -587,6 +587,12 @@ const TURN_ACTIVE_EVENTS = new Set([
 // A turn that has gone this long without producing a single event is not something to keep
 // showing a confident spinner for.
 const NO_RESPONSE_MS = 90 * 1000
+// How often to check the running turn against the transcript on disk. The live stream is fast
+// but lossy; this is slow but true, and it only runs while a turn is supposedly in flight.
+const RECONCILE_EVERY_MS = 4000
+// The transcript lags a send by about a tenth of a second warm and just over a second cold, so
+// this leaves a wide margin before any verdict on a fresh turn is believed.
+const RECONCILE_GRACE_MS = 3000
 
 // Replaying history rebuilds shells only. There is no blanket staleness cutoff here, because
 // wiping the whole list whenever a chat sat quiet is what made the panel vanish on reopen.
@@ -1400,6 +1406,8 @@ function App() {
   // When each session last produced any event, and when its turn was last declared over.
   const lastEventAtRef = useRef({})
   const turnEndedAtRef = useRef({})
+  // When a message was last handed to the runtime, so the reconciler can wait for it to land.
+  const sentAtRef = useRef({})
   // Counts messages actually handed to the runtime, so a queue that empties can be told apart:
   // the runtime took it, or the user deleted it. Those need opposite handling.
   const deliveryCountRef = useRef({})
@@ -1559,6 +1567,7 @@ function App() {
       live: liveIndex !== -1,
     }
   }, [planTodos])
+
 
   // The plan is read on the runtime's signal rather than on a timer: session.todos_changed
   // fires whenever the agent writes to its todo list, and planRevision carries that through.
@@ -2397,6 +2406,9 @@ function App() {
     const optimisticId = `local-${crypto.randomUUID()}`
     patchSessionState(sessionId, { working: true })
     lastEventAtRef.current[sessionId] = Date.now()
+    // The reconciler must not read the transcript until this message has reached it, or it
+    // would see the previous turn's ending and call a turn that just started already over.
+    sentAtRef.current[sessionId] = Date.now()
     deliveryCountRef.current[sessionId] = (deliveryCountRef.current[sessionId] || 0) + 1
     if (selectedIdRef.current === sessionId) {
       setMessages((items) => [...items, {
@@ -2439,6 +2451,35 @@ function App() {
   useEffect(() => {
     drainQueueRef.current = drainQueue
   }, [drainQueue])
+
+  // Settle a running turn against the transcript on disk instead of trusting that the end of it
+  // will always be announced. A dropped ending used to strand the spinner with no way back, and
+  // the only honest thing the UI could do was admit it had stopped hearing anything. Now it goes
+  // and asks. This runs only while a turn is supposedly in flight, so an idle chat costs nothing.
+  useEffect(() => {
+    if (!api?.sessionBusy || !selectedId || !working) return undefined
+    let cancelled = false
+    // Two readings before acting, so a single odd answer cannot end a turn on its own.
+    let quiet = 0
+    const check = () => {
+      // A turn that has only just been sent may not be on disk yet, and reading it now would
+      // return the previous turn's ending.
+      if (Date.now() - (sentAtRef.current[selectedId] || 0) < RECONCILE_GRACE_MS) return
+      api.sessionBusy(selectedId).then((result) => {
+        if (cancelled || !result?.ok) return
+        if (result.busy) { quiet = 0; return }
+        quiet += 1
+        if (quiet < 2) return
+        // The transcript says this turn ended. Anything queued behind it goes now, exactly as it
+        // would have on a live ending.
+        if (!drainQueueRef.current(selectedId)) {
+          patchSessionState(selectedId, { working: false, liveText: '', toolActivity: [] })
+        }
+      }).catch(() => {})
+    }
+    const timer = window.setInterval(check, RECONCILE_EVERY_MS)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [api, selectedId, working, patchSessionState])
 
   const removeQueued = (sessionId, itemId) => {
     writeQueue(sessionId, (items) => items.filter((item) => item.id !== itemId))
@@ -2742,6 +2783,7 @@ function App() {
       delete draftsRef.current[id]
       delete lastEventAtRef.current[id]
       delete turnEndedAtRef.current[id]
+      delete sentAtRef.current[id]
       delete deliveryCountRef.current[id]
       writeQueue(id, [])
       // Without this the draft effect still thinks it is leaving this session on the next
@@ -3625,7 +3667,7 @@ function App() {
                     : (
                       <div className={`thinking${noResponse ? ' quiet' : ''}`}>
                         <LoaderCircle className="spin" size={14} />
-                        {noResponse ? `Nothing for ${elapsedLabel(lastEventAt)}` : 'Working'}
+                        {noResponse ? `Working, quiet for ${elapsedLabel(lastEventAt)}` : 'Working'}
                       </div>
                     )}
                   {!!liveState.toolActivity.length && (
