@@ -264,6 +264,15 @@ function groupByFolder(items, workingDirectory) {
   return [...kept, ...groups.filter((group) => !existing.has(group.value))]
 }
 
+function kindLabel(item) {
+  if (item.kind === 'github') return 'GitHub'
+  if (item.kind === 'notion') return 'Notion'
+  if (item.kind === 'figma') return 'Figma'
+  if (item.kind === 'file') return 'File'
+  if (item.kind === 'folder') return 'Folder'
+  return 'Link'
+}
+
 // Resources are read back out of the transcript, so nothing extra has to be stored per turn.
 function collectResources(messages, workingDirectory) {
   const found = new Map()
@@ -1921,9 +1930,9 @@ function App() {
                       event.preventDefault()
                       setRailMenu({ item, x: event.clientX, y: event.clientY })
                     }}
-                    title={item.value}
+                    title={`${item.source} · ${item.value}`}
                   >
-                    <span className={`rail-dot kind-${item.kind}`} />
+                    <span className={`rail-tag kind-${item.kind}`}>{kindLabel(item)}</span>
                     <span className="rail-chip-label">{item.label}</span>
                   </button>
                 ))}

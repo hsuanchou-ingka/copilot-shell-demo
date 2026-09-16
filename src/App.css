@@ -849,7 +849,7 @@ button {
 }
 
 .rail-strip {
-  height: 34px;
+  height: 36px;
   padding: 0 13px 0 19px;
   display: flex;
   align-items: center;
@@ -876,12 +876,12 @@ button {
 .rail-chip {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 190px;
-  height: 22px;
-  padding: 0 9px 0 7px;
+  max-width: 215px;
+  height: 23px;
+  padding: 0 10px 0 7px;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   border: 1px solid #e0ddd6;
   border-radius: 20px;
   background: #fff;
@@ -895,6 +895,25 @@ button {
   border-color: #c4c0b8;
   color: #2b2721;
 }
+
+.rail-tag {
+  flex: none;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #ebe8e1;
+  color: #6f6b63;
+  font-size: 8.5px;
+  font-weight: 750;
+  letter-spacing: .05em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.rail-tag.kind-github { background: #ecebfa; color: #5450bd; }
+.rail-tag.kind-notion { background: #e6e3dd; color: #2b2721; }
+.rail-tag.kind-figma { background: #fae7e0; color: #b4522f; }
+.rail-tag.kind-folder { background: #f7ebd3; color: #8f6a17; }
+.rail-tag.kind-file { background: #e2f0e7; color: #3f7a5c; }
 
 .rail-chip-label {
   overflow: hidden;
