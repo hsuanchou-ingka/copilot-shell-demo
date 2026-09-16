@@ -8,24 +8,31 @@ import {
   CheckCheck,
   ChevronDown,
   ChevronRight,
+  Code2,
   Copy,
+  Download,
+  ExternalLink,
+  Eye,
   Folder,
   FolderPlus,
   GitFork,
   LoaderCircle,
+  Monitor,
   MoreHorizontal,
   Paperclip,
   PenLine,
   Pin,
+  Play,
   Plus,
+  RefreshCw,
   Search,
   Send,
+  Smartphone,
   Sparkles,
   Square,
+  Tablet,
   TerminalSquare,
   Trash2,
-  Play,
-  Workflow,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -50,6 +57,11 @@ const SELECTED_SESSION_KEY = 'copilot-workbench-selected-session'
 const SIDEBAR_WIDTH_KEY = 'copilot-workbench-sidebar-width'
 const PROJECTS_HEIGHT_KEY = 'copilot-workbench-projects-height'
 const PROJECTS_COLLAPSED_KEY = 'copilot-workbench-projects-collapsed'
+const ARTIFACT_WIDTH_KEY = 'copilot-workbench-artifact-width'
+
+const ARTIFACT_MIN_WIDTH = 320
+const ARTIFACT_MAX_WIDTH = 1100
+const ARTIFACT_DEFAULT_WIDTH = 520
 const RESOURCES_KEY = 'copilot-workbench-resources'
 
 const SIDEBAR_MIN_WIDTH = 240
@@ -67,6 +79,10 @@ function clamp(value, min, max) {
 
 function maxProjectsHeight() {
   return Math.max(PROJECTS_MIN_HEIGHT, Math.round(window.innerHeight * PROJECTS_MAX_HEIGHT_RATIO))
+}
+
+function maxArtifactWidth() {
+  return clamp(Math.round(window.innerWidth - 640), ARTIFACT_MIN_WIDTH, ARTIFACT_MAX_WIDTH)
 }
 
 function isImageName(value) {
@@ -489,6 +505,28 @@ function backgroundActivityFromEvents(events) {
   return state
 }
 
+// A donut that fills clockwise. With no percentage to show it spins slowly instead, so the
+// row still reads as alive rather than stalled.
+function Ring({ percent }) {
+  const radius = 9
+  const circumference = 2 * Math.PI * radius
+  const known = typeof percent === 'number'
+  const offset = known ? circumference * (1 - Math.min(Math.max(percent, 0), 100) / 100) : circumference * 0.7
+  return (
+    <svg className={`background-ring ${known ? '' : 'spinning'}`} viewBox="0 0 22 22" width="22" height="22" aria-hidden="true">
+      <circle className="ring-track" cx="11" cy="11" r={radius} />
+      <circle
+        className="ring-value"
+        cx="11"
+        cy="11"
+        r={radius}
+        strokeDasharray={circumference}
+        strokeDashoffset={offset}
+      />
+    </svg>
+  )
+}
+
 function elapsedLabel(startedAt) {
   const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
   if (seconds < 60) return `${seconds}s`
@@ -637,12 +675,102 @@ function openExternalLink(event, href) {
 
 const RUNNABLE_LANGUAGES = new Set(['bash', 'sh', 'shell', 'zsh', 'console', 'terminal'])
 const RunCommandContext = createContext(null)
+const PreviewContext = createContext(null)
+
+const PREVIEW_DEVICES = [
+  { id: 'desktop', label: 'Desktop', width: null },
+  { id: 'tablet', label: 'Tablet', width: 834 },
+  { id: 'mobile', label: 'Mobile', width: 390 },
+]
+
+// Only markup we can render on its own gets a preview button. Framework code needs a real dev server.
+function previewKindOf(language, code) {
+  const lang = String(language || '').toLowerCase()
+  const body = String(code || '')
+  if (!body.trim()) return null
+  if (lang === 'svg') return 'svg'
+  if (lang === 'html' || lang === 'htm') return 'html'
+  if (lang === 'css') return /[{]/.test(body) ? 'css' : null
+  if (lang && lang !== 'xml' && lang !== 'markup') return null
+  if (/^\s*<svg[\s>]/i.test(body)) return 'svg'
+  if (/<!doctype\s+html|<html[\s>]/i.test(body)) return 'html'
+  if (!lang && /<(div|section|main|header|body|button|ul|table|form|article)[\s>]/i.test(body)) return 'html'
+  return null
+}
+
+const PREVIEW_BRIDGE = `
+<script>
+  (function () {
+    var send = function (payload) {
+      try { window.parent.postMessage(Object.assign({ source: 'hc-preview' }, payload), '*') } catch (e) {}
+    }
+    window.addEventListener('error', function (event) {
+      send({ type: 'error', message: event.message || 'Script error' })
+    })
+    window.addEventListener('unhandledrejection', function (event) {
+      send({ type: 'error', message: String((event.reason && event.reason.message) || event.reason || 'Unhandled rejection') })
+    })
+    document.addEventListener('click', function (event) {
+      var anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null
+      if (!anchor) return
+      var href = anchor.getAttribute('href') || ''
+      if (href.charAt(0) === '#') return
+      event.preventDefault()
+      send({ type: 'navigate', href: anchor.href })
+    })
+    var report = function () {
+      send({ type: 'size', height: document.documentElement.scrollHeight })
+    }
+    window.addEventListener('load', report)
+    setTimeout(report, 60)
+  }())
+</script>
+`
+
+const PREVIEW_RESET = `
+<style>
+  html { box-sizing: border-box; }
+  *, *::before, *::after { box-sizing: inherit; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+</style>
+`
+
+function buildPreviewDocument(kind, code) {
+  const body = String(code || '')
+  if (kind === 'svg') {
+    return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_RESET}
+<style>body{min-height:100vh;display:grid;place-items:center;padding:24px;background:#fff}svg{max-width:100%;height:auto}</style>
+</head><body>${body}${PREVIEW_BRIDGE}</body></html>`
+  }
+  if (kind === 'css') {
+    return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_RESET}<style>${body}</style>
+</head><body><div class="preview-css-note" style="padding:24px;font:13px/1.6 -apple-system,sans-serif;color:#6b6862">
+These styles are loaded. Add markup that uses them to see the result.</div>${PREVIEW_BRIDGE}</body></html>`
+  }
+  if (/<html[\s>]/i.test(body)) {
+    if (/<\/body>/i.test(body)) return body.replace(/<\/body>/i, `${PREVIEW_BRIDGE}</body>`)
+    return `${body}${PREVIEW_BRIDGE}`
+  }
+  return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_RESET}
+</head><body>${body}${PREVIEW_BRIDGE}</body></html>`
+}
+
+function previewTitleOf(kind, code) {
+  const heading = /<title[^>]*>([^<]{1,60})<\/title>/i.exec(code)?.[1]
+    || /<h1[^>]*>([^<]{1,60})<\/h1>/i.exec(code)?.[1]
+  if (heading) return heading.trim()
+  if (kind === 'svg') return 'SVG preview'
+  if (kind === 'css') return 'Stylesheet preview'
+  return 'UI preview'
+}
 
 function CodeBlock({ language, code }) {
   const [copied, setCopied] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const runCommand = useContext(RunCommandContext)
+  const openPreview = useContext(PreviewContext)
   const runnable = Boolean(runCommand) && RUNNABLE_LANGUAGES.has((language || '').toLowerCase()) && code.trim()
+  const previewKind = openPreview ? previewKindOf(language, code) : null
 
   const copy = () => {
     navigator.clipboard?.writeText(code).then(() => {
@@ -660,6 +788,15 @@ function CodeBlock({ language, code }) {
     <div className="code-block">
       <div className="code-block-head">
         <span>{language || 'code'}</span>
+        {previewKind && (
+          <button
+            type="button"
+            className="code-preview"
+            onClick={() => openPreview({ kind: previewKind, language, code })}
+          >
+            <Eye size={11} /> Preview
+          </button>
+        )}
         {runnable && !confirming && (
           <button type="button" className="code-run" onClick={() => setConfirming(true)}>
             <Play size={11} /> Run
@@ -774,6 +911,161 @@ function MessageStatus({ status, attachmentCount }) {
   )
 }
 
+function ArtifactPanel({ artifact, onClose, onError }) {
+  const [tab, setTab] = useState('preview')
+  const [device, setDevice] = useState('desktop')
+  const [runtimeError, setRuntimeError] = useState('')
+  const [reloadKey, setReloadKey] = useState(0)
+  const [copied, setCopied] = useState(false)
+  const frameRef = useRef(null)
+
+  const document_ = useMemo(
+    () => buildPreviewDocument(artifact.kind, artifact.code),
+    [artifact.kind, artifact.code],
+  )
+
+  useEffect(() => {
+    setRuntimeError('')
+    setTab('preview')
+  }, [artifact.id])
+
+  useEffect(() => {
+    const onMessage = (event) => {
+      if (event.data?.source !== 'hc-preview') return
+      if (event.source !== frameRef.current?.contentWindow) return
+      if (event.data.type === 'error') setRuntimeError(String(event.data.message || 'Script error'))
+      if (event.data.type === 'navigate') window.copilot?.openExternal(event.data.href)
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [])
+
+  const reload = () => {
+    setRuntimeError('')
+    setReloadKey((value) => value + 1)
+  }
+
+  const copyCode = () => {
+    navigator.clipboard?.writeText(artifact.code).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1600)
+    }).catch(() => {})
+  }
+
+  const openInBrowser = async () => {
+    const result = await window.copilot?.openPreviewInBrowser?.(document_)
+    if (result && !result.ok) onError(result.error?.message || 'Could not open the preview.')
+  }
+
+  const saveFile = async () => {
+    const result = await window.copilot?.savePreviewHtml?.({
+      html: document_,
+      suggestedName: `${artifact.title.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').toLowerCase() || 'preview'}.html`,
+    })
+    if (result && !result.ok && !result.canceled) onError(result.error?.message || 'Could not save the preview.')
+  }
+
+  const deviceWidth = PREVIEW_DEVICES.find((item) => item.id === device)?.width
+
+  return (
+    <aside className="artifact-panel">
+      <header className="artifact-head">
+        <div className="artifact-title">
+          <span className="artifact-icon"><Eye size={14} /></span>
+          <div>
+            <strong title={artifact.title}>{artifact.title}</strong>
+            <small>{artifact.language || artifact.kind}</small>
+          </div>
+        </div>
+        <button type="button" className="artifact-close" onClick={onClose} aria-label="Close preview">
+          <X size={15} />
+        </button>
+      </header>
+
+      <div className="artifact-toolbar">
+        <div className="artifact-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'preview'}
+            className={tab === 'preview' ? 'active' : ''}
+            onClick={() => setTab('preview')}
+          >
+            <Eye size={12} /> Preview
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'code'}
+            className={tab === 'code' ? 'active' : ''}
+            onClick={() => setTab('code')}
+          >
+            <Code2 size={12} /> Code
+          </button>
+        </div>
+        <div className="artifact-tools">
+          {tab === 'preview' && (
+            <div className="artifact-devices">
+              {PREVIEW_DEVICES.map((item) => (
+                <button
+                  type="button"
+                  key={item.id}
+                  title={item.label}
+                  aria-label={item.label}
+                  className={device === item.id ? 'active' : ''}
+                  onClick={() => setDevice(item.id)}
+                >
+                  {item.id === 'desktop' && <Monitor size={12} />}
+                  {item.id === 'tablet' && <Tablet size={12} />}
+                  {item.id === 'mobile' && <Smartphone size={12} />}
+                </button>
+              ))}
+            </div>
+          )}
+          <button type="button" title="Reload preview" aria-label="Reload preview" onClick={reload}>
+            <RefreshCw size={12} />
+          </button>
+          <button type="button" title="Copy code" aria-label="Copy code" onClick={copyCode}>
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+          </button>
+          <button type="button" title="Save as HTML" aria-label="Save as HTML" onClick={saveFile}>
+            <Download size={12} />
+          </button>
+          <button type="button" title="Open in browser" aria-label="Open in browser" onClick={openInBrowser}>
+            <ExternalLink size={12} />
+          </button>
+        </div>
+      </div>
+
+      {runtimeError && tab === 'preview' && (
+        <div className="artifact-error">
+          <AlertTriangle size={12} />
+          <span>{runtimeError}</span>
+          <button type="button" onClick={() => setRuntimeError('')} aria-label="Dismiss"><X size={11} /></button>
+        </div>
+      )}
+
+      <div className={`artifact-body ${tab}`}>
+        {tab === 'preview' ? (
+          <div className="artifact-stage">
+            <iframe
+              key={`${artifact.id}-${reloadKey}`}
+              ref={frameRef}
+              className="artifact-frame"
+              title="UI preview"
+              sandbox="allow-scripts allow-forms allow-modals"
+              srcDoc={document_}
+              style={deviceWidth ? { width: `${deviceWidth}px` } : undefined}
+            />
+          </div>
+        ) : (
+          <pre className="artifact-code"><code>{artifact.code}</code></pre>
+        )}
+      </div>
+    </aside>
+  )
+}
+
 function App() {
   const api = window.copilot
   const [ready, setReady] = useState(false)
@@ -784,7 +1076,7 @@ function App() {
   const [selectedModel, setSelectedModel] = useState('auto')
   const [messages, setMessages] = useState([])
   const [sessionState, setSessionState] = useState({})
-  const [backgroundPanelFor, setBackgroundPanelFor] = useState(null)
+  const [backgroundProbes, setBackgroundProbes] = useState({})
   const [tick, setTick] = useState(0)
   const [quota, setQuota] = useState(null)
   const [capabilities, setCapabilities] = useState(null)
@@ -842,6 +1134,44 @@ function App() {
   const messageRef = useRef('')
   const attachmentsRef = useRef([])
   const [draftAttachmentCounts, setDraftAttachmentCounts] = useState({})
+  const [artifacts, setArtifacts] = useState({})
+  const [artifactWidth, setArtifactWidth] = useState(() => clamp(
+    Number(loadValue(ARTIFACT_WIDTH_KEY, ARTIFACT_DEFAULT_WIDTH)),
+    ARTIFACT_MIN_WIDTH,
+    ARTIFACT_MAX_WIDTH,
+  ))
+
+  const artifact = selectedId ? artifacts[selectedId] : null
+
+  const openPreview = useCallback(({ kind, language, code }) => {
+    const sessionId = selectedIdRef.current
+    if (!sessionId) return
+    setArtifacts((current) => ({
+      ...current,
+      [sessionId]: {
+        id: `${sessionId}-${Date.now()}`,
+        kind,
+        language,
+        code,
+        title: previewTitleOf(kind, code),
+      },
+    }))
+  }, [])
+
+  const closePreview = useCallback(() => {
+    const sessionId = selectedIdRef.current
+    if (!sessionId) return
+    setArtifacts((current) => {
+      if (!current[sessionId]) return current
+      const next = { ...current }
+      delete next[sessionId]
+      return next
+    })
+  }, [])
+
+  useEffect(() => {
+    saveValue(ARTIFACT_WIDTH_KEY, artifactWidth)
+  }, [artifactWidth])
   const queuesRef = useRef({})
   const [queues, setQueues] = useState({})
   const drainQueueRef = useRef(() => false)
@@ -962,8 +1292,6 @@ function App() {
     return () => clearInterval(timer)
   }, [backgroundAgents.length])
 
-  // Derived from the owning session, so switching sessions closes the panel without an effect.
-  const backgroundPanelOpen = backgroundPanelFor === selectedId && backgroundAgents.length > 0
 
   const sessionEdits = useMemo(
     () => (selectedId && resourceEdits[selectedId]) || EMPTY_EDITS,
@@ -1000,6 +1328,34 @@ function App() {
     if (!text) return
     setError({ message: text, persistent: options.persistent || isAuthErrorMessage(text) })
   }, [])
+
+  // Poll the detached shell logs for progress while background work is live. The shellIds
+  // are the join key, so only shell items are probed; subagents have no log to read.
+  const shellIds = backgroundAgents.filter((item) => item.kind === 'shell').map((item) => item.detail).join(',')
+  useEffect(() => {
+    if (!api?.probeBackground || !shellIds) return undefined
+    let cancelled = false
+    const poll = () => {
+      api.probeBackground(shellIds.split(',')).then((result) => {
+        if (cancelled || !result?.ok) return
+        setBackgroundProbes(result.report)
+        // The .exit file is ground truth: if it exists the command is over, even when the
+        // completion notice never made it into the event log.
+        const finished = Object.values(result.report).filter((probe) => probe.finished).map((probe) => probe.shellId)
+        if (finished.length && selectedId) {
+          patchSessionState(selectedId, (current) => ({
+            ...current,
+            backgroundAgents: current.backgroundAgents.filter(
+              (item) => !(item.kind === 'shell' && finished.includes(item.detail)),
+            ),
+          }))
+        }
+      }).catch(() => {})
+    }
+    poll()
+    const timer = setInterval(poll, 3000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [api, patchSessionState, selectedId, shellIds])
 
   useEffect(() => {
     if (!error || error.persistent) return undefined
@@ -1089,6 +1445,13 @@ function App() {
     setResizing('projects')
   }
 
+  const startArtifactResize = (event) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    dragStateRef.current = { type: 'artifact', origin: event.clientX, start: artifactWidth }
+    setResizing('artifact')
+  }
+
   useEffect(() => {
     if (!resizing) return undefined
     const move = (event) => {
@@ -1097,6 +1460,11 @@ function App() {
       if (state.type === 'sidebar') {
         const next = state.start + (event.clientX - state.origin)
         setSidebarWidth(clamp(Math.round(next), SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
+        return
+      }
+      if (state.type === 'artifact') {
+        const next = state.start - (event.clientX - state.origin)
+        setArtifactWidth(clamp(Math.round(next), ARTIFACT_MIN_WIDTH, maxArtifactWidth()))
         return
       }
       const next = state.start + (event.clientY - state.origin)
@@ -1119,6 +1487,7 @@ function App() {
   useEffect(() => {
     const onWindowResize = () => {
       setProjectsHeight((height) => clamp(height, PROJECTS_MIN_HEIGHT, maxProjectsHeight()))
+      setArtifactWidth((width) => clamp(width, ARTIFACT_MIN_WIDTH, maxArtifactWidth()))
     }
     window.addEventListener('resize', onWindowResize)
     return () => window.removeEventListener('resize', onWindowResize)
@@ -1881,24 +2250,17 @@ function App() {
 
   return (
     <main
-      className={`app-shell ${resizing ? `resizing resizing-${resizing}` : ''}`}
-      style={{ '--sidebar-width': `${sidebarWidth}px` }}
+      className={`app-shell ${artifact ? 'with-artifact' : ''} ${resizing ? `resizing resizing-${resizing}` : ''}`}
+      style={{ '--sidebar-width': `${sidebarWidth}px`, '--artifact-width': `${artifactWidth}px` }}
     >
       <aside className="sidebar">
         <header className="sidebar-header">
-          <button className="brand"><Sparkles size={16} /> <span>Copilot</span></button>
+          <div className="titlebar">
+            <span className="brand"><Sparkles size={15} /> <span>HC Copilot</span></span>
+          </div>
           <div className="header-actions">
             <button className="new-button" onClick={() => createSession()} disabled={!ready}>
-              <Plus size={16} /> New chat
-            </button>
-            <button
-              className="folder-button"
-              onClick={() => createSession({ chooseFolder: true })}
-              disabled={!ready}
-              title="New chat in a specific folder"
-              aria-label="New chat in a specific folder"
-            >
-              <FolderPlus size={15} />
+              <Plus size={15} /> New chat
             </button>
           </div>
         </header>
@@ -1929,6 +2291,16 @@ function App() {
               <span>Projects</span>
             </button>
             <small>{projects.length}</small>
+            <button
+              type="button"
+              className="section-add"
+              onClick={() => createSession({ chooseFolder: true })}
+              disabled={!ready}
+              title="Add a project by picking a folder"
+              aria-label="Add a project by picking a folder"
+            >
+              <FolderPlus size={13} />
+            </button>
           </div>
           {!projectsCollapsed && (
           <div className="projects-scroll">
@@ -1995,6 +2367,49 @@ function App() {
           </div>
         )}
 
+        {backgroundAgents.length > 0 && (
+          <section className="background-rail">
+            <div className="section-title">
+              <span className="background-rail-title">
+                <span className="background-pulse" aria-hidden="true" />
+                Running now
+              </span>
+              <small>{backgroundAgents.length}</small>
+            </div>
+            <div className="background-rail-list">
+              {backgroundAgents.map((agent) => {
+                const probe = agent.kind === 'shell' ? backgroundProbes[agent.detail] : null
+                const percent = typeof probe?.percent === 'number' ? probe.percent : null
+                return (
+                  <div className="background-item" key={agent.id}>
+                    <Ring percent={percent} />
+                    <div className="background-item-body">
+                      <strong title={agent.name}>{agent.name}</strong>
+                      <div className="background-item-meta" key={tick}>
+                        {percent === null
+                          ? <span>{elapsedLabel(agent.startedAt)}</span>
+                          : <span className="background-percent">{percent}%</span>}
+                        <span className="background-dot-sep">·</span>
+                        <span>
+                          {probe?.eta
+                            ? `${probe.eta} left`
+                            : (percent === null ? 'no progress reported' : elapsedLabel(agent.startedAt))}
+                        </span>
+                      </div>
+                      <div className="background-bar">
+                        <span
+                          className={percent === null ? 'indeterminate' : ''}
+                          style={percent === null ? undefined : { width: `${percent}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </section>
+        )}
+
         <div className="search-box">
           <Search size={14} />
           <input
@@ -2059,6 +2474,7 @@ function App() {
 
       <section className="workspace">
        <RunCommandContext.Provider value={runCommandFromBlock}>
+        <PreviewContext.Provider value={openPreview}>
         <header className="topbar">
           <div className="session-title">
             <span className="session-title-icon"><TerminalSquare size={16} /></span>
@@ -2342,45 +2758,6 @@ function App() {
           </div>
         )}
 
-        {backgroundAgents.length > 0 && (
-          <div className="background-float">
-            <button
-              type="button"
-              className={`background-toggle ${backgroundPanelOpen ? 'open' : ''}`}
-              onClick={() => setBackgroundPanelFor(backgroundPanelOpen ? null : selectedId)}
-              title={`${backgroundAgents.length} background agent${backgroundAgents.length > 1 ? 's' : ''} running`}
-              aria-expanded={backgroundPanelOpen}
-            >
-              <span className="background-pulse" aria-hidden="true" />
-              <Workflow size={13} />
-              {backgroundAgents.length}
-            </button>
-            {backgroundPanelOpen && (
-              <div className="background-panel">
-                <div className="background-panel-head">
-                  Running in the background
-                  <button type="button" onClick={() => setBackgroundPanelFor(null)} aria-label="Close">
-                    <X size={12} />
-                  </button>
-                </div>
-                {backgroundAgents.map((agent) => (
-                  <div className="background-item" key={agent.id}>
-                    <div className="background-item-head">
-                      <strong>{agent.name}</strong>
-                      <small key={tick}>{elapsedLabel(agent.startedAt)}</small>
-                    </div>
-                    {agent.detail && (
-                      <span className="background-model">
-                        {agent.kind === 'shell' ? `shell: ${agent.detail}` : agent.detail}
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
         <div
           className={`conversation ${draggingFiles ? 'dragging-files' : ''}`}
           ref={conversationRef}
@@ -2571,8 +2948,26 @@ function App() {
             </div>
           </div>
         )}
+        </PreviewContext.Provider>
        </RunCommandContext.Provider>
       </section>
+
+      {artifact && (
+        <>
+          <div
+            className="artifact-resize-handle"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize the preview panel"
+            title="Drag to resize, double click to reset"
+            onPointerDown={startArtifactResize}
+            onDoubleClick={() => setArtifactWidth(ARTIFACT_DEFAULT_WIDTH)}
+          >
+            <span />
+          </div>
+          <ArtifactPanel artifact={artifact} onClose={closePreview} onError={showError} />
+        </>
+      )}
 
       {activePermission && (
         <div className="permission-backdrop">

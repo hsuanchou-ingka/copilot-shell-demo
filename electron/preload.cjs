@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron')
 contextBridge.exposeInMainWorld('copilot', {
   initialize: () => ipcRenderer.invoke('copilot:initialize'),
   refreshQuota: () => ipcRenderer.invoke('copilot:refresh-quota'),
+  probeBackground: (shellIds) => ipcRenderer.invoke('copilot:probe-background', shellIds),
   createSession: (options) => ipcRenderer.invoke('copilot:create-session', options),
   forkSession: (options) => ipcRenderer.invoke('copilot:fork-session', options),
   openSession: (sessionId) => ipcRenderer.invoke('copilot:open-session', sessionId),
@@ -11,6 +12,8 @@ contextBridge.exposeInMainWorld('copilot', {
   pickAttachments: () => ipcRenderer.invoke('copilot:pick-attachments'),
   savePastedImage: (data, extension) => ipcRenderer.invoke('copilot:save-pasted-image', { data, extension }),
   readAttachmentPreview: (filePath) => ipcRenderer.invoke('copilot:read-attachment-preview', filePath),
+  openPreviewInBrowser: (html) => ipcRenderer.invoke('preview:open-in-browser', html),
+  savePreviewHtml: (options) => ipcRenderer.invoke('preview:save-html', options),
   getPathForFile: (file) => webUtils.getPathForFile(file),
   instructionFiles: (workingDirectory) => ipcRenderer.invoke('copilot:instruction-files', workingDirectory),
   setModel: (options) => ipcRenderer.invoke('copilot:set-model', options),

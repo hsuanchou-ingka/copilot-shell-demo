@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, screen, shell }
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
@@ -62,6 +62,7 @@ const IMAGE_MIME_TYPES = {
   webp: 'image/webp',
 }
 const ATTACHMENT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+const PREVIEWS_DIRECTORY = path.join(app.getPath('temp'), 'hc-copilot-previews')
 const DEFAULT_BOUNDS = { width: 1360, height: 880 }
 const MIN_WINDOW_WIDTH = 940
 const MIN_WINDOW_HEIGHT = 650
@@ -371,6 +372,120 @@ ipcMain.handle('copilot:instruction-files', async (_event, workingDirectory) => 
   }
 })
 
+// Detached shells write three sibling files into the temp dir: a .log of their output,
+// a .pid, and a .exit that only appears once the command is over. The .exit file is the
+// only trustworthy "is it done" signal, so we check for it before parsing anything.
+const DETACHED_PREFIX = 'copilot-detached-'
+
+// tqdm renders "83%|####  | 25/30 [03:36<00:44,  5.9s/it]", which carries both the
+// percentage and the estimated time left. Progress bars repaint with carriage returns,
+// so the tail has to be split on \r as well as \n.
+const TQDM_RE = /(\d{1,3})%\|[^|]*\|\s*(\d+)\/(\d+)\s*\[([\d:]+)<([\d:]+)/
+// Rich (PyTorch Lightning) renders "Epoch 39/39 ---- 40/40 0:01:07 • 0:00:00", where the
+// value after the bullet is the time remaining.
+const RICH_RE = /(?:epoch|step)\s+(\d+)\/(\d+).*?\s(\d+:\d{2}(?::\d{2})?)\s*•\s*(\d+:\d{2}(?::\d{2})?)/i
+const FRACTION_RE = /(?:epoch|step|iter|iteration)\s*[:\s]?\s*(\d+)\s*\/\s*(\d+)/i
+const PERCENT_RE = /(\d{1,3}(?:\.\d+)?)\s*%/
+
+function parseProgress(tail) {
+  const lines = tail.split(/[\r\n]+/).map((line) => line.trim()).filter(Boolean)
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]
+
+    const tqdm = line.match(TQDM_RE)
+    if (tqdm) {
+      return { percent: Number(tqdm[1]), done: Number(tqdm[2]), total: Number(tqdm[3]), eta: tqdm[5], line }
+    }
+
+    const rich = line.match(RICH_RE)
+    if (rich) {
+      const done = Number(rich[1])
+      const total = Number(rich[2])
+      if (total > 0 && done <= total) {
+        return { percent: Math.round((done / total) * 100), done, total, eta: rich[4], line }
+      }
+    }
+
+    const fraction = line.match(FRACTION_RE)
+    if (fraction) {
+      const done = Number(fraction[1])
+      const total = Number(fraction[2])
+      if (total > 0 && done <= total) {
+        return { percent: Math.round((done / total) * 100), done, total, eta: '', line }
+      }
+    }
+
+    const percent = line.match(PERCENT_RE)
+    if (percent) {
+      const value = Number(percent[1])
+      if (value >= 0 && value <= 100) return { percent: Math.round(value), eta: '', line }
+    }
+  }
+  return { percent: null, eta: '', line: lines[lines.length - 1] || '' }
+}
+
+async function probeDetachedShell(shellId) {
+  const directory = app.getPath('temp')
+  let entries = []
+  try {
+    entries = await readdir(directory)
+  } catch {
+    return null
+  }
+
+  // Names look like copilot-detached-<shellId>-<epochMs>-<uuid>.log. Matching on the plain
+  // prefix would let "training" swallow "training-resume", so the timestamp anchors the id.
+  const escaped = shellId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const namePattern = new RegExp(`^${DETACHED_PREFIX}${escaped}-\\d{10,}-[^-]`)
+  const logs = entries.filter((name) => name.endsWith('.log') && namePattern.test(name))
+  if (!logs.length) return null
+
+  let newest = null
+  for (const name of logs) {
+    const full = path.join(directory, name)
+    try {
+      const stats = statSync(full)
+      if (!newest || stats.mtimeMs > newest.mtimeMs) newest = { full, name, mtimeMs: stats.mtimeMs }
+    } catch { /* the file may vanish between listing and stat */ }
+  }
+  if (!newest) return null
+
+  const finished = existsSync(newest.full.replace(/\.log$/, '.exit'))
+
+  let tail = ''
+  try {
+    const handle = await open(newest.full, 'r')
+    try {
+      const { size } = await handle.stat()
+      const length = Math.min(size, 16 * 1024)
+      const buffer = Buffer.alloc(length)
+      await handle.read(buffer, 0, length, size - length)
+      tail = buffer.toString('utf8')
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return { shellId, finished, percent: null, eta: '', line: '' }
+  }
+
+  const progress = parseProgress(tail)
+  return { shellId, finished, updatedAt: newest.mtimeMs, ...progress }
+}
+
+ipcMain.handle('copilot:probe-background', async (_event, shellIds) => {
+  try {
+    const list = Array.isArray(shellIds) ? shellIds.filter(Boolean).slice(0, 24) : []
+    const probes = await Promise.all(list.map((id) => probeDetachedShell(id).catch(() => null)))
+    const report = {}
+    probes.forEach((probe, index) => {
+      if (probe) report[list[index]] = probe
+    })
+    return { ok: true, report }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 ipcMain.handle('copilot:refresh-quota', async () => {
   try {
     const copilot = await getClient()
@@ -599,6 +714,40 @@ ipcMain.handle('app:open-external', async (_event, url) => {
     return { ok: true }
   } catch {
     return { ok: false }
+  }
+})
+
+ipcMain.handle('preview:open-in-browser', async (_event, html) => {
+  try {
+    if (typeof html !== 'string' || !html.trim()) {
+      return { ok: false, error: { message: 'There is nothing to preview.' } }
+    }
+    await mkdir(PREVIEWS_DIRECTORY, { recursive: true })
+    const filePath = path.join(PREVIEWS_DIRECTORY, `preview-${randomUUID()}.html`)
+    await writeFile(filePath, html, 'utf8')
+    const error = await shell.openPath(filePath)
+    if (error) return { ok: false, error: { message: error } }
+    return { ok: true, path: filePath }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('preview:save-html', async (_event, { html, suggestedName } = {}) => {
+  try {
+    if (typeof html !== 'string' || !html.trim()) {
+      return { ok: false, error: { message: 'There is nothing to save.' } }
+    }
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save preview',
+      defaultPath: suggestedName || 'preview.html',
+      filters: [{ name: 'HTML', extensions: ['html'] }],
+    })
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true }
+    await writeFile(result.filePath, html, 'utf8')
+    return { ok: true, path: result.filePath }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
   }
 })
 
