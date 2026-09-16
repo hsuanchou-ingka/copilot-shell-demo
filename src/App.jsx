@@ -559,21 +559,31 @@ function foldBackgroundActivity(state, event) {
 // so once one runs this long without a notice the record is almost certainly lost.
 const UNTRACKED_SHELL_MAX_MS = 20 * 60 * 1000
 
-// A turn announces its ending four times over, from the model, the assistant layer and the
-// session, all inside about fifteen milliseconds. Listening only for the last of them means one
-// dropped event leaves the composer insisting it is working with no way back, so any of them
-// counts as the ending.
+// A turn ends twice over, from the assistant layer and from the session, about two milliseconds
+// apart. Listening only for the last of them means one dropped event leaves the composer
+// insisting it is working with no way back, so either one counts as the ending.
+//
+// The model's own turn_ended and the assistant's turn_end look like they belong here and do not:
+// they fire once per model call, which means once before every tool the turn uses. Treating them
+// as the ending releases a queued message into the middle of a turn that is still working.
 const TURN_END_EVENTS = new Set([
-  'model.turn_ended',
-  'assistant.turn_end',
   'assistant.idle',
   'session.idle',
 ])
-// That burst has to produce one ending rather than four, or a queued message would be sent once
-// per signal and the whole queue would empty in a few milliseconds. Genuine turns are seconds
-// apart, so collapsing a second of them is safe, and the window also heals itself: nothing
-// needs to reset it for the next turn's ending to land, it just has to be a second later.
+// That pair has to produce one ending rather than two, or a queued message would be sent once
+// per signal. Genuine turns are seconds apart, so collapsing a second of them is safe, and the
+// window also heals itself: nothing needs to reset it for the next turn's ending to land, it
+// just has to be a second later.
 const TURN_END_WINDOW_MS = 1000
+// Any of these means work is genuinely under way, which clears the window above. Relying on the
+// turn's own start signal alone would be a single point of failure of exactly the kind that
+// caused this problem: if it went missing, a turn that finished inside the window would have its
+// ending mistaken for an echo of the previous one and the composer would never come back.
+const TURN_ACTIVE_EVENTS = new Set([
+  'model.turn_started',
+  'assistant.message_delta',
+  'tool.execution_start',
+])
 // A turn that has gone this long without producing a single event is not something to keep
 // showing a confident spinner for.
 const NO_RESPONSE_MS = 90 * 1000
@@ -1918,9 +1928,9 @@ function App() {
     const unsubscribeEvents = api.onEvent(({ sessionId, event }) => {
       const isSelected = sessionId === selectedIdRef.current
       lastEventAtRef.current[sessionId] = Date.now()
-      // A new turn clears the debounce above, so a turn that starts and ends quickly still
+      // Work under way clears the debounce below, so a turn that starts and ends quickly still
       // registers its own ending rather than being mistaken for an echo of the previous one.
-      if (event.type === 'model.turn_started') turnEndedAtRef.current[sessionId] = 0
+      if (TURN_ACTIVE_EVENTS.has(event.type)) turnEndedAtRef.current[sessionId] = 0
       // Signal-only event: the plan changed and has to be re-read. Only the visible chat needs
       // to react, since the panel reads for whichever chat is selected.
       if (event.type === 'session.todos_changed' && isSelected) {
