@@ -647,17 +647,24 @@ ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attac
 // a dropped end-of-turn event used to leave the spinner running forever with no way back.
 // The transcript on disk is the truth, so this exists to go and ask.
 //
-// Note the transcript is a filtered record, not the raw stream. It keeps user.message and
-// assistant.turn_end but not session.idle, so the turn boundary has to be read from turn_end.
-// A turn is still running when the last user message comes after the last boundary.
+// The transcript is a filtered record, not the raw stream. It keeps user.message and the
+// assistant's turn boundaries but not session.idle, so the answer has to be read from those
+// boundaries. They do not mean what they look like: the assistant opens and closes a turn once
+// per model call, so a request that runs three commands closes four of them on its way through.
+// Reading the last close as the end therefore calls a turn over while it is still working, which
+// on a long turn is most of the time it is running. What actually settles it is whether a turn
+// was left open: work is under way while the assistant has started a turn it has not closed, or
+// while the last thing on record is the user asking for something.
 ipcMain.handle('copilot:session-busy', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
     const types = (await session.getEvents()).map((event) => event.type)
     const lastUser = types.lastIndexOf('user.message')
+    const lastStart = types.lastIndexOf('assistant.turn_start')
+    const lastEnd = types.lastIndexOf('assistant.turn_end')
     // session.start counts as a boundary so a chat that has never been used reads as idle.
-    const lastBoundary = Math.max(types.lastIndexOf('assistant.turn_end'), types.lastIndexOf('session.start'))
-    return { ok: true, busy: lastUser > lastBoundary }
+    const lastBoundary = Math.max(lastEnd, types.lastIndexOf('session.start'))
+    return { ok: true, busy: lastUser > lastBoundary || lastStart > lastEnd }
   } catch (error) {
     return { ok: false, error: serializeError(error) }
   }
