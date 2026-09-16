@@ -2368,6 +2368,42 @@ button {
   opacity: .5;
 }
 
+/* The count of seconds, set in a fixed pitch so the line does not shuffle sideways every time
+   a digit changes. This number moving is the part that proves the turn is alive. */
+.thinking-clock {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: #97928a;
+}
+
+/* The counterpart: a turn that has ended says so. Same size and colour family as the working
+   line it replaces, so the swap reads as one state becoming another rather than a new thing
+   appearing. The tick borrows the settled green already used for completed plan steps. */
+.turn-settled {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0 44px;
+  font-size: 11px;
+}
+
+/* Green is kept for work that ran to the end, so it stays a real signal rather than a
+   decoration on every ending. A turn that was cut short or fell over reads as neutral. */
+.turn-settled.is-done {
+  color: #4a7a5c;
+}
+
+.turn-settled.is-stopped,
+.turn-settled.is-failed {
+  color: #97928a;
+}
+
+.turn-settled.is-stopped svg,
+.turn-settled.is-failed svg {
+  fill: currentColor;
+}
+
 .tool-activity {
   margin-top: 12px;
   padding: 9px 10px;

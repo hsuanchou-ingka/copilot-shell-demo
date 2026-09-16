@@ -204,8 +204,50 @@ const SCENES = {
       const node = document.querySelector('.thinking')
       if (!node) return
       node.classList.add('quiet')
-      node.lastChild.textContent = 'Working, quiet for 2m 30s'
+      node.firstChild.nextSibling.textContent = 'Working, quiet for 2m 30s'
     }, 700)
+  },
+
+  // A turn in flight, counting.
+  running() {
+    const box = document.querySelector('.composer textarea')
+    typeInto(box, 'Check every semantic token against the naming rules')
+    pressEnter(box)
+  },
+
+  // The same turn once it has ended.
+  settled() {
+    const box = document.querySelector('.composer textarea')
+    typeInto(box, 'Check every semantic token against the naming rules')
+    pressEnter(box)
+    window.setTimeout(() => emit({ type: 'session.idle', data: {} }), 900)
+  },
+
+  // A turn the user cut short. It must not read back as finished work.
+  stopped() {
+    const box = document.querySelector('.composer textarea')
+    typeInto(box, 'Check every semantic token against the naming rules')
+    pressEnter(box)
+    window.setTimeout(() => {
+      const stop = [...document.querySelectorAll('button')]
+        .find((node) => node.textContent.trim().startsWith('Stop'))
+      if (stop) stop.click()
+    }, 900)
+  },
+
+  // What it looks like in the ordinary case, where a reply arrives and then the turn ends.
+  settledAfterReply() {
+    const box = document.querySelector('.composer textarea')
+    typeInto(box, 'Check every semantic token against the naming rules')
+    pressEnter(box)
+    window.setTimeout(() => {
+      startWork()
+      emit({
+        type: 'assistant.message',
+        data: { content: 'Reverting `border/subtle` to `#E5E5E5`, then opening a pull request against the design system repo.' },
+      })
+      emit({ type: 'session.idle', data: {} })
+    }, 900)
   },
 
   permission() {

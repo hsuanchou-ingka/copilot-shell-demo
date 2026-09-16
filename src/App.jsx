@@ -47,6 +47,14 @@ const EMPTY_SESSION_STATE = {
   backgroundAgents: [],
   pendingTools: {},
   agentHint: null,
+  // When the current turn started and when it finished. A spinner alone cannot prove a turn is
+  // alive, because a CSS animation keeps turning whatever the runtime is doing. A counting
+  // number can, and the pair of them is what lets a finished turn say so rather than just stop.
+  turnStartedAt: 0,
+  turnEndedAt: 0,
+  // Why it ended: done, stopped by hand, or failed. A turn the user cut short must not be
+  // reported back to them as finished work.
+  turnOutcome: '',
 }
 const EMPTY_QUEUE = []
 const EMPTY_TASKS = []
@@ -593,6 +601,13 @@ const RECONCILE_EVERY_MS = 4000
 // The transcript lags a send by about a tenth of a second warm and just over a second cold, so
 // this leaves a wide margin before any verdict on a fresh turn is believed.
 const RECONCILE_GRACE_MS = 3000
+// Each ending in its own words. "Finished" is reserved for work that ran to the end, so it keeps
+// meaning something; the other two say the turn is over without claiming anything was achieved.
+const SETTLED_LABEL = {
+  done: 'Finished in',
+  stopped: 'Stopped after',
+  failed: 'Ended after',
+}
 
 // Replaying history rebuilds shells only. There is no blanket staleness cutoff here, because
 // wiping the whole list whenever a chat sat quiet is what made the panel vanish on reopen.
@@ -697,6 +712,17 @@ function Ring({ percent }) {
 
 function elapsedLabel(startedAt) {
   const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+// The same shape between two moments, for a turn that has already finished and so cannot be
+// measured against now.
+function elapsedBetween(startedAt, endedAt) {
+  // Floored at a second: no turn takes no time, and "0s" reads like the clock is broken.
+  const seconds = Math.max(1, Math.floor((endedAt - startedAt) / 1000))
   if (seconds < 60) return `${seconds}s`
   const minutes = Math.floor(seconds / 60)
   if (minutes < 60) return `${minutes}m ${seconds % 60}s`
@@ -1523,6 +1549,23 @@ function App() {
   // tick here is what keeps the label counting up.
   const lastEventAt = lastEventAtRef.current[selectedId] || 0
   const noResponse = Boolean(working && lastEventAt && tick - lastEventAt > NO_RESPONSE_MS)
+  // Reading tick keeps this counting while the turn runs. A spinner on its own is not proof of
+  // life, because the animation keeps going whatever the runtime is doing, but a number that
+  // moves cannot be produced by something that has stopped.
+  const runningFor = working && liveState.turnStartedAt
+    ? elapsedBetween(liveState.turnStartedAt, tick)
+    : ''
+  // How long the finished turn took, so the end of the work is stated rather than left to be
+  // inferred from a spinner that is no longer there. Absence is what made this ambiguous.
+  const settled = !working && liveState.turnStartedAt && liveState.turnEndedAt
+    ? {
+      // Only work that actually finished gets the settled green. A turn that was cut short or
+      // fell over is over, which is the thing worth knowing, but it is not an accomplishment.
+      outcome: liveState.turnOutcome || 'done',
+      label: SETTLED_LABEL[liveState.turnOutcome] || SETTLED_LABEL.done,
+      time: elapsedBetween(liveState.turnStartedAt, liveState.turnEndedAt),
+    }
+    : null
   // A plain background shell that gets killed never reports a completion, so it would hang
   // around forever. Detached shells are exempt: their log files tell us the real status.
   const backgroundShells = liveState.backgroundAgents.filter((item) => (
@@ -1669,6 +1712,13 @@ function App() {
     setSessionState((current) => {
       const previous = current[sessionId] || EMPTY_SESSION_STATE
       const next = typeof patch === 'function' ? patch(previous) : { ...previous, ...patch }
+      // Stamped here rather than at each of the several places a turn can end, so no route out
+      // of a turn can forget to record that it happened. Callers that end a turn for a reason
+      // other than the work being done say so in the same patch.
+      if (previous.working && !next.working && !next.turnEndedAt) {
+        next.turnEndedAt = Date.now()
+        if (!next.turnOutcome) next.turnOutcome = 'done'
+      }
       return { ...current, [sessionId]: next }
     })
   }, [])
@@ -2018,7 +2068,9 @@ function App() {
         // runtime may even switch model and carry on. Deleting the queue here threw away
         // messages the user had already written over a blip they never chose, so the queue
         // stays. It is visible in the composer, so they can send it, edit it or drop it.
-        patchSessionState(sessionId, { working: false, liveText: '', toolActivity: [] })
+        patchSessionState(sessionId, {
+          working: false, liveText: '', toolActivity: [], turnOutcome: 'failed',
+        })
         if (isSelected) showError(event.data?.message || 'The Copilot session reported an error.')
       }
     })
@@ -2404,7 +2456,9 @@ function App() {
       displayName,
     }))
     const optimisticId = `local-${crypto.randomUUID()}`
-    patchSessionState(sessionId, { working: true })
+    patchSessionState(sessionId, {
+      working: true, turnStartedAt: Date.now(), turnEndedAt: 0, turnOutcome: '',
+    })
     lastEventAtRef.current[sessionId] = Date.now()
     // The reconciler must not read the transcript until this message has reached it, or it
     // would see the previous turn's ending and call a turn that just started already over.
@@ -2598,7 +2652,9 @@ function App() {
       status: 'sent',
       commandEcho: true,
     }])
-    patchSessionState(sessionId, { working: true })
+    patchSessionState(sessionId, {
+      working: true, turnStartedAt: Date.now(), turnEndedAt: 0, turnOutcome: '',
+    })
 
     const result = await api.invokeCommand({ sessionId, name: known.name, input: parsed.input })
     if (!result?.ok) {
@@ -2707,7 +2763,7 @@ function App() {
     // drop them when they actually finish.
     patchSessionState(sessionId, { liveText: '', toolActivity: [] })
     if (!waitingId) {
-      patchSessionState(sessionId, { working: false })
+      patchSessionState(sessionId, { working: false, turnOutcome: 'stopped' })
       return
     }
 
@@ -2724,7 +2780,7 @@ function App() {
       // Nothing was sent and the message is gone, so it was deleted by hand. There is no turn
       // left to wait for, and the composer must not be left insisting it is working.
       if (!drainQueueRef.current(sessionId)) {
-        patchSessionState(sessionId, { working: false })
+        patchSessionState(sessionId, { working: false, turnOutcome: 'stopped' })
       }
     }, 1500)
   }
@@ -3667,7 +3723,10 @@ function App() {
                     : (
                       <div className={`thinking${noResponse ? ' quiet' : ''}`}>
                         <LoaderCircle className="spin" size={14} />
-                        {noResponse ? `Working, quiet for ${elapsedLabel(lastEventAt)}` : 'Working'}
+                        {noResponse
+                          ? `Working, quiet for ${elapsedLabel(lastEventAt)}`
+                          : 'Working'}
+                        {!!runningFor && <span className="thinking-clock">{runningFor}</span>}
                       </div>
                     )}
                   {!!liveState.toolActivity.length && (
@@ -3682,6 +3741,15 @@ function App() {
                   )}
                 </div>
               </article>
+            )}
+
+            {/* The end of a turn was only ever shown by the spinner going away, and an absence
+                cannot be told apart from an indicator that has broken. This says it instead. */}
+            {!!settled && (
+              <p className={`turn-settled is-${settled.outcome}`}>
+                {settled.outcome === 'done' ? <Check size={12} /> : <Square size={10} />}
+                {settled.label} {settled.time}
+              </p>
             )}
           </div>
         </div>
