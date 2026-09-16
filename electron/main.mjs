@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, screen, shell }
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
-import { mkdir, open, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
@@ -325,12 +325,31 @@ function attachSession(session) {
 // is listening to. So a resume already in flight is shared rather than repeated.
 const resumingSessions = new Map()
 
+// Deleting a session and resuming it are both several awaits long, and they can overlap. If a
+// resume is in flight when deletion looks at the active map, it finds nothing to tear down,
+// attaches its handle afterwards, and leaves a live subscription pointing at a session the
+// runtime has already thrown away. Every later call then gets handed that ghost instead of
+// failing honestly. Marking a deletion in progress closes both directions: new work refuses to
+// start, and the deletion waits for work already started before it decides what to clean up.
+const deletingSessions = new Set()
+
+function refuseIfDeleting(sessionId) {
+  if (deletingSessions.has(sessionId)) throw new Error('This chat is being deleted.')
+}
+
 async function resumeSession(sessionId) {
+  refuseIfDeleting(sessionId)
   const active = activeSessions.get(sessionId)
   if (active) return active.session
 
   const pending = resumingSessions.get(sessionId)
-  if (pending) return pending
+  // Awaited rather than returned, so a deletion that begins while this resume is in flight is
+  // still noticed before the handle is handed out.
+  if (pending) {
+    const session = await pending
+    refuseIfDeleting(sessionId)
+    return session
+  }
 
   const attempt = (async () => {
     const copilot = await getClient()
@@ -345,7 +364,9 @@ async function resumeSession(sessionId) {
   })
 
   resumingSessions.set(sessionId, attempt)
-  return attempt
+  const session = await attempt
+  refuseIfDeleting(sessionId)
+  return session
 }
 
 // Returns null when the read fails rather than an error-shaped object. Handing that object back
@@ -587,8 +608,12 @@ ipcMain.handle('copilot:create-session', async (_event, options = {}) => {
   }
 })
 
-ipcMain.handle('copilot:fork-session', async (_event, { sessionId, name }) => {
+// A payload that is missing or null is unpacked inside the handler, not in the parameter list.
+// Destructuring in the parameter list runs before the body, so the try below cannot catch it and
+// the renderer gets a raw rejection instead of the refusal every other failure returns.
+ipcMain.handle('copilot:fork-session', async (_event, payload) => {
   try {
+    const { sessionId, name } = payload || {}
     const copilot = await getClient()
     const sessions = await copilot.listSessions()
     const source = sessions.find((item) => item.sessionId === sessionId)
@@ -627,8 +652,9 @@ ipcMain.handle('copilot:open-session', async (_event, sessionId) => {
   }
 })
 
-ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attachments }) => {
+ipcMain.handle('copilot:send-message', async (_event, payload) => {
   try {
+    const { sessionId, prompt, attachments } = payload || {}
     const session = await resumeSession(sessionId)
     const safeAttachments = Array.isArray(attachments)
       ? attachments
@@ -766,8 +792,9 @@ ipcMain.handle('copilot:list-commands', async (_event, sessionId) => {
 
 // Invoking returns one of several shapes. Only two matter to this UI: text to print, or a
 // prompt to hand to the agent. Everything else is reported as handled with no output.
-ipcMain.handle('copilot:invoke-command', async (_event, { sessionId, name, input }) => {
+ipcMain.handle('copilot:invoke-command', async (_event, payload) => {
   try {
+    const { sessionId, name, input } = payload || {}
     const session = await resumeSession(sessionId)
     const result = await session.rpc.commands.invoke({ name, input: input || '' })
     if (result?.kind === 'text') {
@@ -877,7 +904,9 @@ ipcMain.handle('copilot:read-attachment-preview', async (_event, filePath) => {
   }
 })
 
-ipcMain.handle('copilot:set-model', async (_event, { sessionId, model }) => {  try {
+ipcMain.handle('copilot:set-model', async (_event, payload) => {
+  try {
+    const { sessionId, model } = payload || {}
     const session = await resumeSession(sessionId)
     await session.setModel(model)
     return { ok: true }
@@ -887,7 +916,17 @@ ipcMain.handle('copilot:set-model', async (_event, { sessionId, model }) => {  t
 })
 
 ipcMain.handle('copilot:delete-session', async (_event, sessionId) => {
+  if (!sessionId) return { ok: false, error: { message: 'No chat was given to delete.' } }
+  if (deletingSessions.has(sessionId)) {
+    return { ok: false, error: { message: 'This chat is already being deleted.' } }
+  }
+  deletingSessions.add(sessionId)
   try {
+    // A resume that was already in flight will still attach its handle, so wait for it and then
+    // look again. Tearing down the map as it looked before that finished left the new handle
+    // subscribed to a session about to be deleted.
+    const resuming = resumingSessions.get(sessionId)
+    if (resuming) await resuming.catch(() => {})
     const active = activeSessions.get(sessionId)
     if (active) {
       // Drop it from the map before tearing it down. A disconnect that throws used to leave an
@@ -905,6 +944,8 @@ ipcMain.handle('copilot:delete-session', async (_event, sessionId) => {
     return { ok: true }
   } catch (error) {
     return { ok: false, error: serializeError(error) }
+  } finally {
+    deletingSessions.delete(sessionId)
   }
 })
 
@@ -925,12 +966,32 @@ ipcMain.handle('app:open-external', async (_event, url) => {
   }
 })
 
+// A preview cannot be deleted once it is handed to the browser, which may not have opened it
+// yet, so yesterday's are swept before a new one is written. Nothing here is worth keeping:
+// the transcript it came from still holds the content.
+const PREVIEW_KEEP_MS = 24 * 60 * 60 * 1000
+
+async function prunePreviews() {
+  try {
+    const names = await readdir(PREVIEWS_DIRECTORY)
+    const cutoff = Date.now() - PREVIEW_KEEP_MS
+    await Promise.all(names.map(async (name) => {
+      const filePath = path.join(PREVIEWS_DIRECTORY, name)
+      try {
+        const info = await stat(filePath)
+        if (info.mtimeMs < cutoff) await rm(filePath, { force: true })
+      } catch { /* a preview that vanished underneath us needs no sweeping */ }
+    }))
+  } catch { /* nothing written yet, or temp is unreadable: neither is worth reporting */ }
+}
+
 ipcMain.handle('preview:open-in-browser', async (_event, html) => {
   try {
     if (typeof html !== 'string' || !html.trim()) {
       return { ok: false, error: { message: 'There is nothing to preview.' } }
     }
     await mkdir(PREVIEWS_DIRECTORY, { recursive: true })
+    await prunePreviews()
     const filePath = path.join(PREVIEWS_DIRECTORY, `preview-${randomUUID()}.html`)
     await writeFile(filePath, html, 'utf8')
     const error = await shell.openPath(filePath)
@@ -941,8 +1002,9 @@ ipcMain.handle('preview:open-in-browser', async (_event, html) => {
   }
 })
 
-ipcMain.handle('preview:save-html', async (_event, { html, suggestedName } = {}) => {
+ipcMain.handle('preview:save-html', async (_event, payload) => {
   try {
+    const { html, suggestedName } = payload || {}
     if (typeof html !== 'string' || !html.trim()) {
       return { ok: false, error: { message: 'There is nothing to save.' } }
     }
@@ -980,7 +1042,10 @@ ipcMain.handle('app:reveal-path', async (_event, targetPath) => {
   }
 })
 
-ipcMain.on('copilot:permission-answer', (_event, { requestId, approved, forSession }) => {
+// This one is a listener, not a request, so a bad payload would throw on the main process event
+// stack with nobody to catch it rather than coming back as a refusal.
+ipcMain.on('copilot:permission-answer', (_event, payload) => {
+  const { requestId, approved, forSession } = payload || {}
   const pending = pendingPermissions.get(requestId)
   if (!pending) return
   pendingPermissions.delete(requestId)

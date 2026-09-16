@@ -68,6 +68,10 @@ const EMPTY_PLAN = { sessionId: null, todos: EMPTY_TODOS }
 // needs no explaining.
 const PLAN_MIN_STEPS = 2
 
+// Ticking a step off should show up while you are watching, not a beat later, so the plan is
+// read more often than the task registry. It only runs while a turn is working.
+const PLAN_POLL_MS = 2000
+
 // Task identity plus intent is everything the panel renders, so comparing those is enough to
 // tell a meaningless poll from a real change.
 function sameTaskList(a, b) {
@@ -1620,27 +1624,43 @@ function App() {
       // Position is counted from what is finished, so it reads as "on step 4 of 8" even when
       // the agent has not marked anything in progress.
       position: Math.min(planTodos.length, doneCount + 1),
-      live: liveIndex !== -1,
+      // A step is only in progress while a turn is actually running. The status is the agent's
+      // own note to itself and it does not go back to tidy it, so a turn that stopped halfway
+      // leaves one marked in progress for good. Believing that note on an idle chat put a
+      // spinner on screen for work that had been abandoned hours earlier.
+      live: liveIndex !== -1 && working,
     }
-  }, [planTodos])
+  }, [planTodos, working])
 
 
-  // The plan is read on the runtime's signal rather than on a timer: session.todos_changed
-  // fires whenever the agent writes to its todo list, and planRevision carries that through.
+  // The plan has to be read rather than waited for. session.todos_changed is documented as the
+  // signal for this and is the obvious thing to listen to, but the runtime does not send it: a
+  // turn that wrote three todos and ticked one off fired it zero times, so a panel built on it
+  // only ever showed whatever was true the moment the chat was opened. A plan left over from
+  // yesterday would sit there reading as live work.
+  //
+  // So it is read on a timer, but only while a turn is running, which is the only time the
+  // agent writes to the list. The effect re-runs when the turn ends, which takes the final
+  // state, and then stops polling an idle chat.
   useEffect(() => {
     if (!api?.readTodos || !selectedId) return undefined
     let cancelled = false
-    api.readTodos(selectedId).then((result) => {
-      if (cancelled) return
-      const next = result?.ok ? result.todos : EMPTY_TODOS
-      setPlan((current) => (
-        current.sessionId === selectedId && sameTodoList(current.todos, next)
-          ? current
-          : { sessionId: selectedId, todos: next }
-      ))
-    }).catch(() => {})
-    return () => { cancelled = true }
-  }, [api, selectedId, planRevision])
+    const poll = () => {
+      api.readTodos(selectedId).then((result) => {
+        if (cancelled) return
+        const next = result?.ok ? result.todos : EMPTY_TODOS
+        setPlan((current) => (
+          current.sessionId === selectedId && sameTodoList(current.todos, next)
+            ? current
+            : { sessionId: selectedId, todos: next }
+        ))
+      }).catch(() => {})
+    }
+    poll()
+    if (!working) return () => { cancelled = true }
+    const timer = setInterval(poll, PLAN_POLL_MS)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [api, selectedId, planRevision, working])
 
   // Poll the runtime task registry for this chat. agentHint bumps the poll the moment a
   // background agent starts, so the panel appears immediately instead of on the next tick.
@@ -2179,7 +2199,11 @@ function App() {
         showError(result.error?.message || 'Could not open this session.')
         return
       }
-      setMessages(messagesFromEvents(result.events))
+      // Reading the transcript takes a round trip, and a turn that is already running keeps
+      // talking during it. Anything that arrived in the meantime belongs to this session and
+      // is newer than the transcript, so fold it back in rather than overwriting it.
+      const history = messagesFromEvents(result.events)
+      setMessages((live) => (live.length ? live.reduce(mergeMessage, history) : history))
       // Rebuild work that was already running before this session was opened.
       const activity = backgroundActivityFromEvents(result.events)
       patchSessionState(selectedId, activity)
@@ -2556,6 +2580,20 @@ function App() {
     return true
   }, [deliverMessage, writeQueue])
 
+  // Every way of sending goes through here, because "is a turn running" is not the only reason
+  // to wait your turn. A failed send leaves its message queued while the session goes idle, and
+  // a new message that skipped the queue would arrive out of order and strand the older one with
+  // nothing left to drain it. So: anything waiting means the new message joins the back, and an
+  // idle session starts draining from the front straight away.
+  const sendOrQueue = useCallback((sessionId, prompt, attachments, isWorking) => {
+    if (!isWorking && !queuesRef.current[sessionId]?.length) {
+      deliverMessage(sessionId, prompt, attachments)
+      return
+    }
+    writeQueue(sessionId, (items) => [...items, { id: crypto.randomUUID(), prompt, attachments }])
+    if (!isWorking) drainQueue(sessionId)
+  }, [deliverMessage, drainQueue, writeQueue])
+
   useEffect(() => {
     drainQueueRef.current = drainQueue
   }, [drainQueue])
@@ -2658,16 +2696,8 @@ function App() {
     const prompt = `Run this in the terminal and show me the output:\n\n\`\`\`bash\n${command}\n\`\`\``
     setError(null)
     // Queue instead of dropping the command when the session is mid-turn.
-    if (sessionState[selectedId]?.working) {
-      writeQueue(selectedId, (items) => [...items, {
-        id: crypto.randomUUID(),
-        prompt,
-        attachments: [],
-      }])
-      return
-    }
-    deliverMessage(selectedId, prompt, [])
-  }, [deliverMessage, selectedId, sessionState, writeQueue])
+    sendOrQueue(selectedId, prompt, [], sessionState[selectedId]?.working)
+  }, [selectedId, sendOrQueue, sessionState])
 
   // Completing a command keeps whatever the user already typed after the name, so editing
   // "/pla fix the docs" into "/plan fix the docs" does not lose the argument.
@@ -2786,15 +2816,7 @@ function App() {
 
     clearDraft(sessionId)
     setError(null)
-    if (working) {
-      writeQueue(sessionId, (items) => [...items, {
-        id: crypto.randomUUID(),
-        prompt,
-        attachments: sentAttachments,
-      }])
-      return
-    }
-    deliverMessage(sessionId, prompt, sentAttachments)
+    sendOrQueue(sessionId, prompt, sentAttachments, working)
   }
 
   // A typing shortcut, nothing more. It behaves exactly as if the words had been typed into
@@ -2802,15 +2824,7 @@ function App() {
   const keepWorking = () => {
     if (!selectedId) return
     setError(null)
-    if (working) {
-      writeQueue(selectedId, (items) => [...items, {
-        id: crypto.randomUUID(),
-        prompt: KEEP_WORKING_PROMPT,
-        attachments: [],
-      }])
-      return
-    }
-    deliverMessage(selectedId, KEEP_WORKING_PROMPT, [])
+    sendOrQueue(selectedId, KEEP_WORKING_PROMPT, [], working)
   }
 
   // Stopping means "that turn was going nowhere", and when a message is already waiting it also
@@ -3897,7 +3911,7 @@ function App() {
             {!!selectedQueue.length && (
               <div className="queue-strip">
                 <div className="queue-heading">
-                  {working ? 'Queued · sends when this turn finishes' : 'Queued · sends with your next message'}
+                  {working ? 'Queued · sends when this turn finishes' : 'Queued · sends before your next message'}
                 </div>
                 {selectedQueue.map((item, index) => (
                   <div className="queue-item" key={item.id}>
