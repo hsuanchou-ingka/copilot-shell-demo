@@ -602,6 +602,27 @@ ipcMain.handle('app:open-external', async (_event, url) => {
   }
 })
 
+ipcMain.handle('app:open-path', async (_event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) return { ok: false }
+    const error = await shell.openPath(targetPath)
+    if (error) return { ok: false, error: { message: error } }
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('app:reveal-path', async (_event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) return { ok: false }
+    shell.showItemInFolder(targetPath)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 ipcMain.on('copilot:permission-answer', (_event, { requestId, approved, forSession }) => {
   const pending = pendingPermissions.get(requestId)
   if (!pending) return

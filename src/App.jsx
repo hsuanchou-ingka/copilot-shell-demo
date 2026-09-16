@@ -30,6 +30,8 @@ import './App.css'
 
 const EMPTY_SESSION_STATE = { working: false, liveText: '', toolActivity: [] }
 const EMPTY_QUEUE = []
+const EMPTY_EDITS = Object.freeze({ hidden: [], manual: [], labels: {} })
+const RAIL_PREVIEW_COUNT = 4
 const PROJECT_PREVIEW_COUNT = 8
 const ERROR_DISMISS_MS = 8000
 
@@ -41,6 +43,7 @@ const SELECTED_SESSION_KEY = 'copilot-workbench-selected-session'
 const SIDEBAR_WIDTH_KEY = 'copilot-workbench-sidebar-width'
 const PROJECTS_HEIGHT_KEY = 'copilot-workbench-projects-height'
 const PROJECTS_COLLAPSED_KEY = 'copilot-workbench-projects-collapsed'
+const RESOURCES_KEY = 'copilot-workbench-resources'
 
 const SIDEBAR_MIN_WIDTH = 240
 const SIDEBAR_MAX_WIDTH = 520
@@ -111,6 +114,132 @@ function projectName(session) {
   const directory = workingDirectoryOf(session)
   if (!directory) return session?.remote ? 'Cloud session' : 'General'
   return folderLabel(directory)
+}
+
+const URL_PATTERN = /https?:\/\/[^\s<>()[\]"'`]+/g
+const PATH_PATTERN = /(?:^|[\s(`'"])(\/(?:Users|Volumes|opt|srv|Applications)\/[^\s`'")\]]+)/g
+const FILE_EXTENSION_PATTERN = /\.[a-z0-9]{1,6}$/i
+const NOTION_HASH_PATTERN = /-?[0-9a-f]{32}$/i
+const NOISE_HOSTS = [
+  'stackoverflow.com',
+  'developer.mozilla.org',
+  'npmjs.com',
+  'google.com',
+  'wikipedia.org',
+]
+
+function trimTrailingPunctuation(value) {
+  return value.replace(/[.,;:!?)\]}'"`]+$/, '')
+}
+
+function decodeSlug(slug) {
+  try {
+    return decodeURIComponent(slug)
+  } catch {
+    return slug
+  }
+}
+
+// Notion puts the page title in the URL slug, so a readable label needs no network call.
+function notionLabel(url) {
+  const slug = url.pathname.split('/').filter(Boolean).at(-1) || ''
+  const title = decodeSlug(slug).replace(NOTION_HASH_PATTERN, '').replace(/-/g, ' ').trim()
+  return title || 'Notion page'
+}
+
+function githubLabel(url) {
+  const parts = url.pathname.split('/').filter(Boolean)
+  if (parts.length < 2) return parts[0] || 'GitHub'
+  const repo = `${parts[0]}/${parts[1]}`
+  if (parts[2] === 'pull' && parts[3]) return `${repo}#${parts[3]}`
+  if (parts[2] === 'issues' && parts[3]) return `${repo}#${parts[3]}`
+  return repo
+}
+
+function figmaLabel(url) {
+  const name = url.pathname.split('/').filter(Boolean).at(-1) || ''
+  return decodeSlug(name).replace(/-/g, ' ').trim() || 'Figma file'
+}
+
+function classifyLink(rawUrl) {
+  let url
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    return null
+  }
+  const host = url.hostname.replace(/^www\./, '')
+  if (NOISE_HOSTS.some((noise) => host === noise || host.endsWith(`.${noise}`))) return null
+  if (host.endsWith('notion.so') || host.endsWith('notion.site')) {
+    return { kind: 'notion', label: notionLabel(url), source: 'Notion' }
+  }
+  if (host === 'github.com' || host.endsWith('.github.com')) {
+    return { kind: 'github', label: githubLabel(url), source: 'GitHub' }
+  }
+  if (host.endsWith('figma.com')) {
+    return { kind: 'figma', label: figmaLabel(url), source: 'Figma' }
+  }
+  return { kind: 'link', label: host, source: host }
+}
+
+function classifyPath(rawPath) {
+  const name = folderLabel(rawPath)
+  if (!name) return null
+  const isFile = FILE_EXTENSION_PATTERN.test(name)
+  return {
+    kind: isFile ? 'file' : 'folder',
+    label: name,
+    source: isFile ? 'File' : 'Folder',
+  }
+}
+
+// Resources are read back out of the transcript, so nothing extra has to be stored per turn.
+function collectResources(messages, workingDirectory) {
+  const found = new Map()
+  const remember = (value, detail, order) => {
+    if (!detail) return
+    const existing = found.get(value)
+    if (existing) {
+      existing.count += 1
+      existing.order = order
+      return
+    }
+    found.set(value, { id: value, value, ...detail, count: 1, order })
+  }
+
+  messages.forEach((message, index) => {
+    const content = typeof message.content === 'string' ? message.content : ''
+    if (!content) return
+    const urls = content.match(URL_PATTERN) || []
+    urls.forEach((raw) => {
+      const value = trimTrailingPunctuation(raw)
+      remember(value, classifyLink(value), index)
+    })
+    for (const match of content.matchAll(PATH_PATTERN)) {
+      const value = trimTrailingPunctuation(match[1])
+      if (value === workingDirectory) continue
+      remember(value, classifyPath(value), index)
+    }
+  })
+
+  const list = [...found.values()].sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count
+    return b.order - a.order
+  })
+
+  if (workingDirectory) {
+    list.unshift({
+      id: workingDirectory,
+      value: workingDirectory,
+      kind: 'folder',
+      label: folderLabel(workingDirectory),
+      source: 'Working folder',
+      count: 1,
+      order: Infinity,
+      root: true,
+    })
+  }
+  return list
 }
 
 function displayTime(value) {
@@ -437,6 +566,22 @@ function App() {
   const [queues, setQueues] = useState({})
   const drainQueueRef = useRef(() => false)
 
+  const [resourceEdits, setResourceEdits] = useState(() => loadValue(RESOURCES_KEY, {}) || {})
+  const [railOpen, setRailOpen] = useState(false)
+  const [railDraft, setRailDraft] = useState(null)
+  const [railMenu, setRailMenu] = useState(null)
+
+  useEffect(() => saveValue(RESOURCES_KEY, resourceEdits), [resourceEdits])
+
+  const editResources = useCallback((sessionId, updater) => {
+    if (!sessionId) return
+    setResourceEdits((current) => {
+      const existing = current[sessionId] || { hidden: [], manual: [], labels: {} }
+      const next = updater(existing)
+      return { ...current, [sessionId]: next }
+    })
+  }, [])
+
   // Queued messages are keyed by session so typing ahead in one never leaks into another.
   const writeQueue = useCallback((sessionId, updater) => {
     if (!sessionId) return
@@ -528,6 +673,27 @@ function App() {
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
   const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
+
+  const sessionEdits = useMemo(
+    () => (selectedId && resourceEdits[selectedId]) || EMPTY_EDITS,
+    [resourceEdits, selectedId],
+  )
+  const resources = useMemo(() => {
+    const detected = collectResources(messages, selectedWorkingDirectory)
+    const hidden = new Set(sessionEdits.hidden || [])
+    const manual = (sessionEdits.manual || []).map((item) => ({ ...item, manual: true, count: 1 }))
+    const manualValues = new Set(manual.map((item) => item.value))
+    const merged = [
+      ...manual,
+      ...detected.filter((item) => !manualValues.has(item.value)),
+    ].filter((item) => !hidden.has(item.value))
+    const roots = merged.filter((item) => item.root)
+    const rest = merged.filter((item) => !item.root)
+    return [...roots, ...rest].map((item) => ({
+      ...item,
+      label: sessionEdits.labels?.[item.value] || item.label,
+    }))
+  }, [messages, selectedWorkingDirectory, sessionEdits])
 
   const patchSessionState = useCallback((sessionId, patch) => {
     setSessionState((current) => {
@@ -1104,6 +1270,65 @@ function App() {
     writeQueue(sessionId, (items) => items.filter((item) => item.id !== itemId))
   }
 
+  const openResource = (item) => {
+    if (item.kind === 'folder' || item.kind === 'file') {
+      api.openPath(item.value).then((result) => {
+        if (!result?.ok) showError(`Could not open ${item.value}`)
+      })
+      return
+    }
+    api.openExternal(item.value)
+  }
+
+  const insertResource = (item) => {
+    setMessage((current) => {
+      const spacer = !current || current.endsWith(' ') || current.endsWith('\n') ? '' : ' '
+      return `${current}${spacer}${item.value} `
+    })
+    composerRef.current?.focus()
+  }
+
+  const hideResource = (item) => {
+    editResources(selectedId, (edits) => ({
+      ...edits,
+      hidden: [...new Set([...(edits.hidden || []), item.value])],
+      manual: (edits.manual || []).filter((entry) => entry.value !== item.value),
+    }))
+  }
+
+  const renameResource = (item, label) => {
+    const trimmed = label.trim()
+    editResources(selectedId, (edits) => {
+      const labels = { ...(edits.labels || {}) }
+      if (trimmed) labels[item.value] = trimmed
+      else delete labels[item.value]
+      return { ...edits, labels }
+    })
+  }
+
+  const addResource = (value, label) => {
+    const trimmed = value.trim()
+    if (!trimmed) return
+    const detail = trimmed.startsWith('/')
+      ? classifyPath(trimmed)
+      : classifyLink(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`)
+    if (!detail) {
+      showError('That does not look like a link or a folder path.')
+      return
+    }
+    const resolved = trimmed.startsWith('/') || trimmed.startsWith('http') ? trimmed : `https://${trimmed}`
+    editResources(selectedId, (edits) => ({
+      ...edits,
+      hidden: (edits.hidden || []).filter((entry) => entry !== resolved),
+      manual: [
+        ...(edits.manual || []).filter((entry) => entry.value !== resolved),
+        { id: resolved, value: resolved, ...detail },
+      ],
+      labels: label?.trim() ? { ...(edits.labels || {}), [resolved]: label.trim() } : edits.labels,
+    }))
+    setRailDraft(null)
+  }
+
   const sendMessage = () => {
     const typedPrompt = message.trim()
     if ((!typedPrompt && !attachments.length) || !selectedId) return
@@ -1610,6 +1835,147 @@ function App() {
             </div>
           </div>
         </header>
+
+        {selected && (resources.length > 0 || railOpen) && (
+          <div className={`resource-rail ${railOpen ? 'open' : ''}`}>
+            <div className="rail-strip">
+              <div className="rail-chips">
+                {(railOpen ? [] : resources.slice(0, RAIL_PREVIEW_COUNT)).map((item) => (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className={`rail-chip kind-${item.kind}`}
+                    onClick={() => openResource(item)}
+                    onContextMenu={(event) => {
+                      event.preventDefault()
+                      setRailMenu({ item, x: event.clientX, y: event.clientY })
+                    }}
+                    title={item.value}
+                  >
+                    <span className={`rail-dot kind-${item.kind}`} />
+                    <span className="rail-chip-label">{item.label}</span>
+                  </button>
+                ))}
+                {!railOpen && resources.length > RAIL_PREVIEW_COUNT && (
+                  <span className="rail-more">+{resources.length - RAIL_PREVIEW_COUNT}</span>
+                )}
+                {railOpen && <span className="rail-heading">Resources in this session</span>}
+              </div>
+              <button
+                type="button"
+                className="rail-toggle"
+                onClick={() => setRailOpen((value) => !value)}
+                aria-expanded={railOpen}
+                aria-label={railOpen ? 'Collapse resources' : 'Expand resources'}
+              >
+                <ChevronDown size={14} />
+              </button>
+            </div>
+
+            {railOpen && (
+              <div className="rail-panel">
+                {resources.map((item) => (
+                  <div className="rail-row" key={item.id}>
+                    <span className={`rail-dot kind-${item.kind}`} />
+                    <button type="button" className="rail-row-label" onClick={() => openResource(item)}>
+                      {item.label}
+                    </button>
+                    <span className="rail-source">{item.source}</span>
+                    <button
+                      type="button"
+                      className="rail-row-action"
+                      onClick={() => insertResource(item)}
+                      title="Add to your message"
+                      aria-label={`Add ${item.label} to your message`}
+                    >
+                      <Plus size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      className="rail-row-action"
+                      onClick={(event) => setRailMenu({ item, x: event.clientX, y: event.clientY })}
+                      title="More"
+                      aria-label={`More options for ${item.label}`}
+                    >
+                      <MoreHorizontal size={13} />
+                    </button>
+                  </div>
+                ))}
+                {!resources.length && (
+                  <p className="rail-empty">Links and folders you mention will show up here.</p>
+                )}
+                {railDraft === null ? (
+                  <button type="button" className="rail-add" onClick={() => setRailDraft('')}>
+                    <Plus size={13} /> Add a link or folder
+                  </button>
+                ) : (
+                  <form
+                    className="rail-add-form"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      addResource(railDraft)
+                    }}
+                  >
+                    <input
+                      autoFocus
+                      value={railDraft}
+                      placeholder="Paste a link or /Users/you/folder"
+                      onChange={(event) => setRailDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Escape') setRailDraft(null)
+                      }}
+                    />
+                    <button type="submit">Add</button>
+                    <button type="button" onClick={() => setRailDraft(null)}>Cancel</button>
+                  </form>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {railMenu && (
+          <>
+            <div className="row-menu-backdrop" onMouseDown={() => setRailMenu(null)} />
+            <div
+              className="row-menu"
+              style={{
+                top: Math.min(railMenu.y + 4, window.innerHeight - 190),
+                left: Math.min(railMenu.x, window.innerWidth - 190),
+              }}
+            >
+              <button type="button" onClick={() => { insertResource(railMenu.item); setRailMenu(null) }}>
+                Add to your message
+              </button>
+              <button type="button" onClick={() => { openResource(railMenu.item); setRailMenu(null) }}>
+                Open
+              </button>
+              {(railMenu.item.kind === 'folder' || railMenu.item.kind === 'file') && (
+                <button type="button" onClick={() => { api.revealPath(railMenu.item.value); setRailMenu(null) }}>
+                  Show in Finder
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  const next = window.prompt('Name this resource', railMenu.item.label)
+                  if (next !== null) renameResource(railMenu.item, next)
+                  setRailMenu(null)
+                }}
+              >
+                Rename
+              </button>
+              <div className="row-menu-divider" />
+              <button
+                type="button"
+                className="danger"
+                onClick={() => { hideResource(railMenu.item); setRailMenu(null) }}
+              >
+                Remove
+              </button>
+            </div>
+          </>
+        )}
 
         {error && (
           <div className="error-banner">

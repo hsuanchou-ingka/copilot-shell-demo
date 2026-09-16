@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('copilot', {
   setModel: (options) => ipcRenderer.invoke('copilot:set-model', options),
   deleteSession: (sessionId) => ipcRenderer.invoke('copilot:delete-session', sessionId),
   openExternal: (url) => ipcRenderer.invoke('app:open-external', url),
+  openPath: (targetPath) => ipcRenderer.invoke('app:open-path', targetPath),
+  revealPath: (targetPath) => ipcRenderer.invoke('app:reveal-path', targetPath),
   openGitHub: () => ipcRenderer.invoke('app:open-external', 'https://github.com/hsuanchou-ingka'),
   answerPermission: (answer) => ipcRenderer.send('copilot:permission-answer', answer),
   onEvent: (handler) => {
