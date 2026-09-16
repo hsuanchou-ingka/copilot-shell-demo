@@ -535,6 +535,23 @@ function foldBackgroundActivity(state, event) {
 // so once one runs this long without a notice the record is almost certainly lost.
 const UNTRACKED_SHELL_MAX_MS = 20 * 60 * 1000
 
+// A turn announces its ending four times over, from the model, the assistant layer and the
+// session, all inside about fifteen milliseconds. Listening only for the last of them means one
+// dropped event leaves the composer insisting it is working with no way back, so any of them
+// counts as the ending.
+const TURN_END_EVENTS = new Set([
+  'model.turn_ended',
+  'assistant.turn_end',
+  'assistant.idle',
+  'session.idle',
+])
+// That burst has to produce one ending rather than four, or a queued message would be sent once
+// per signal. Genuine turns are seconds apart, so collapsing a second of them is safe.
+const TURN_END_WINDOW_MS = 1000
+// A turn that has gone this long without producing a single event is not something to keep
+// showing a confident spinner for.
+const NO_RESPONSE_MS = 90 * 1000
+
 // Replaying history rebuilds shells only. There is no blanket staleness cutoff here, because
 // wiping the whole list whenever a chat sat quiet is what made the panel vanish on reopen.
 // Liveness is settled afterwards: detached shells by their log files, the rest by the ceiling
@@ -1339,6 +1356,9 @@ function App() {
   const queuesRef = useRef({})
   const [queues, setQueues] = useState({})
   const drainQueueRef = useRef(() => false)
+  // When each session last produced any event, and when its turn was last declared over.
+  const lastEventAtRef = useRef({})
+  const turnEndedAtRef = useRef({})
 
   const [resourceEdits, setResourceEdits] = useState(() => loadValue(RESOURCES_KEY, {}) || {})
   const [railOpen, setRailOpen] = useState(false)
@@ -1446,6 +1466,11 @@ function App() {
   const quotaSnapshot = quota?.premium_interactions || quota?.chat || null
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
+  // A turn that has stopped producing events has stopped telling us anything, so after a while
+  // the composer says how long it has been quiet instead of implying steady progress. Reading
+  // tick here is what keeps the label counting up.
+  const lastEventAt = lastEventAtRef.current[selectedId] || 0
+  const noResponse = Boolean(working && lastEventAt && tick - lastEventAt > NO_RESPONSE_MS)
   // A plain background shell that gets killed never reports a completion, so it would hang
   // around forever. Detached shells are exempt: their log files tell us the real status.
   const backgroundShells = liveState.backgroundAgents.filter((item) => (
@@ -1514,12 +1539,13 @@ function App() {
     if (paletteOpen) activeRowRef.current?.scrollIntoView({ block: 'nearest' })
   }, [paletteIndex, paletteOpen])
 
-  // Only tick while background work exists, so an idle app does no per-second work.
+  // Tick while there is background work or a live turn, so elapsed times stay honest. An idle
+  // app with nothing running does no per-second work.
   useEffect(() => {
-    if (!backgroundAgents.length) return undefined
+    if (!backgroundAgents.length && !working) return undefined
     const timer = setInterval(() => setTick(Date.now()), 1000)
     return () => clearInterval(timer)
-  }, [backgroundAgents.length])
+  }, [backgroundAgents.length, working])
 
 
   const sessionEdits = useMemo(
@@ -1816,6 +1842,10 @@ function App() {
 
     const unsubscribeEvents = api.onEvent(({ sessionId, event }) => {
       const isSelected = sessionId === selectedIdRef.current
+      lastEventAtRef.current[sessionId] = Date.now()
+      // A new turn clears the debounce above, so a turn that starts and ends quickly still
+      // registers its own ending rather than being mistaken for an echo of the previous one.
+      if (event.type === 'model.turn_started') turnEndedAtRef.current[sessionId] = 0
 
       if (event.type === 'assistant.message_delta') {
         patchSessionState(sessionId, (current) => ({
@@ -1868,16 +1898,21 @@ function App() {
       }
       patchSessionState(sessionId, (current) => foldBackgroundActivity(current, event))
 
-      if (event.type === 'session.idle') {
-        // Background shells and agents outlive a turn, so they are never cleared here.
-        patchSessionState(sessionId, { liveText: '', toolActivity: [] })
-        // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
-        if (!drainQueueRef.current(sessionId)) {
-          patchSessionState(sessionId, { working: false })
+      if (TURN_END_EVENTS.has(event.type)) {
+        const now = Date.now()
+        // One ending per turn, no matter how many ways the runtime says it.
+        if (now - (turnEndedAtRef.current[sessionId] || 0) > TURN_END_WINDOW_MS) {
+          turnEndedAtRef.current[sessionId] = now
+          // Background shells and agents outlive a turn, so they are never cleared here.
+          patchSessionState(sessionId, { liveText: '', toolActivity: [] })
+          // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
+          if (!drainQueueRef.current(sessionId)) {
+            patchSessionState(sessionId, { working: false })
+          }
+          api.refreshQuota().then((result) => {
+            if (result.ok) setQuota(result.quota)
+          }).catch((e) => showError(e?.message || String(e)))
         }
-        api.refreshQuota().then((result) => {
-          if (result.ok) setQuota(result.quota)
-        }).catch((e) => showError(e?.message || String(e)))
       }
       if (event.type === 'session.error') {
         patchSessionState(sessionId, { working: false, backgroundAgents: [] })
@@ -2271,6 +2306,8 @@ function App() {
     }))
     const optimisticId = `local-${crypto.randomUUID()}`
     patchSessionState(sessionId, { working: true })
+    lastEventAtRef.current[sessionId] = Date.now()
+    turnEndedAtRef.current[sessionId] = 0
     if (selectedIdRef.current === sessionId) {
       setMessages((items) => [...items, {
         id: optimisticId,
@@ -3420,7 +3457,12 @@ function App() {
                   <div className="speaker">Copilot</div>
                   {liveState.liveText
                     ? <MessageBody role="assistant" content={liveState.liveText} />
-                    : <div className="thinking"><LoaderCircle className="spin" size={14} /> Working</div>}
+                    : (
+                      <div className={`thinking${noResponse ? ' quiet' : ''}`}>
+                        <LoaderCircle className="spin" size={14} />
+                        {noResponse ? `Nothing for ${elapsedLabel(lastEventAt)}` : 'Working'}
+                      </div>
+                    )}
                   {!!liveState.toolActivity.length && (
                     <div className="tool-activity">
                       {liveState.toolActivity.map((tool) => (

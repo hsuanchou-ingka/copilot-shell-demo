@@ -2185,6 +2185,17 @@ button {
   font-size: 11px;
 }
 
+/* Nothing has arrived for a long time. The spinner slows right down so the motion stops
+   implying steady progress it cannot vouch for, and the label says how long it has been. */
+.thinking.quiet {
+  color: #6f6a62;
+}
+
+.thinking.quiet .spin {
+  animation-duration: 3.4s;
+  opacity: .5;
+}
+
 .tool-activity {
   margin-top: 12px;
   padding: 9px 10px;
