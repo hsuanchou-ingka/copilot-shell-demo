@@ -729,6 +729,16 @@ function elapsedBetween(startedAt, endedAt) {
   return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 
+// A message that failed to send comes back to the composer. If something is already typed there,
+// the returned text used to be dropped on the floor, which is the one thing this app must never
+// do: those are words the user wrote and asked to send. Both are kept, and the returned one goes
+// first because it was written first.
+function mergeDraftText(existing, returned) {
+  if (!returned?.trim()) return existing
+  if (!existing?.trim()) return returned
+  return `${returned}\n\n${existing}`
+}
+
 function displayTime(value) {
   if (!value) return ''
   const date = new Date(value)
@@ -1314,6 +1324,9 @@ function App() {
   const [paletteIndex, setPaletteIndex] = useState(0)
   const [tick, setTick] = useState(() => Date.now())
   const [quota, setQuota] = useState(null)
+  // A read that failed is not a read still in flight, and the dial must not keep promising
+  // figures that are never going to arrive.
+  const [quotaFailed, setQuotaFailed] = useState(false)
   const [capabilities, setCapabilities] = useState(null)
   const [knowledge, setKnowledge] = useState([])
   const [toolkitOpen, setToolkitOpen] = useState(false)
@@ -1510,7 +1523,7 @@ function App() {
   const restoreDraft = useCallback((sessionId, draft) => {
     if (!sessionId) return
     if (sessionId === draftSessionIdRef.current) {
-      setMessage((current) => (current.trim() ? current : draft.message))
+      setMessage((current) => mergeDraftText(current, draft.message))
       setAttachments((current) => {
         const paths = new Set(current.map((item) => item.path))
         return [...current, ...draft.attachments.filter((item) => !paths.has(item.path))]
@@ -1521,7 +1534,7 @@ function App() {
     const paths = new Set(stored.attachments.map((item) => item.path))
     const merged = [...stored.attachments, ...draft.attachments.filter((item) => !paths.has(item.path))]
     draftsRef.current[sessionId] = {
-      message: stored.message.trim() ? stored.message : draft.message,
+      message: mergeDraftText(stored.message, draft.message),
       attachments: merged,
     }
     setDraftAttachmentCounts((current) => ({ ...current, [sessionId]: merged.length }))
@@ -2059,7 +2072,10 @@ function App() {
             patchSessionState(sessionId, { working: false })
           }
           api.refreshQuota().then((result) => {
-            if (result.ok) setQuota(result.quota)
+            // A failed read leaves the last known figure on screen rather than blanking it.
+            // Stale usage is still useful; an empty dial is not.
+            if (result.ok && result.quota) setQuota(result.quota)
+            else setQuotaFailed(true)
           }).catch((e) => showError(e?.message || String(e)))
         }
       }
@@ -2112,6 +2128,7 @@ function App() {
       setModels(result.models)
       setSessions(sorted)
       setQuota(result.quota)
+      if (!result.quota) setQuotaFailed(true)
       setCapabilities(result.capabilities)
       setKnowledge(result.capabilities?.knowledge || [])
       setSelectedModel(result.models[0]?.id || 'auto')
@@ -2168,6 +2185,19 @@ function App() {
       patchSessionState(selectedId, activity)
       const current = result.currentModel
       if (current?.modelId) setSelectedModel(current.modelId)
+      // A turn already running when this session was opened has no live event to announce
+      // itself, so the composer used to offer to send straight into a busy session and the
+      // stop control was missing. Ask the transcript whether a turn is in flight.
+      if (!api.sessionBusy) return
+      api.sessionBusy(selectedId).then((busy) => {
+        if (!active || selectedIdRef.current !== selectedId) return
+        if (!busy?.ok || !busy.busy) return
+        patchSessionState(selectedId, (state) => (state.working ? state : {
+          // No start time: this turn began before the window did, and a clock counting from
+          // the moment we noticed would report a duration that is simply untrue.
+          ...state, working: true, turnStartedAt: 0, turnEndedAt: 0, turnOutcome: '',
+        }))
+      }).catch(() => {})
     }).catch((e) => showError(e?.message || String(e)))
     return () => {
       active = false
@@ -2192,13 +2222,18 @@ function App() {
   }, [isOwnedSession, openSession, selectedId, selectedProject, sessions])
 
   useEffect(() => {
-    if (!api) return
+    if (!api) return undefined
     const directory = isFolderKey(selectedProject)
       ? selectedProject
       : (isFolderKey(selectedWorkingDirectory) ? selectedWorkingDirectory : '')
+    // A slow answer for the folder just left would otherwise land after the new one and show
+    // the previous project's knowledge files against this project.
+    let cancelled = false
     api.instructionFiles(directory).then((result) => {
+      if (cancelled) return
       if (result.ok) setKnowledge(result.files.map((file) => file.label))
-    }).catch((e) => showError(e?.message || String(e)))
+    }).catch((e) => { if (!cancelled) showError(e?.message || String(e)) })
+    return () => { cancelled = true }
   }, [api, selectedProject, selectedWorkingDirectory])
 
   // The composer is absolutely positioned so the conversation can fade out behind it, which
@@ -2338,23 +2373,32 @@ function App() {
     }
   }, [jumpToMyTurn])
 
-  const addAttachmentItems = useCallback((incoming) => {
+  // `ownerId` is the chat the attachment was chosen for. Picking a file, reading a thumbnail or
+  // saving a pasted image all take a moment, and the user can change chat in that time. The
+  // attachment belongs to the chat they were in when they chose it, not to whichever one is on
+  // screen when the read finishes.
+  const addAttachmentItems = useCallback((incoming, ownerId) => {
     const usable = incoming.filter((item) => item && item.path)
     if (!usable.length) return
+    if (ownerId && ownerId !== draftSessionIdRef.current) {
+      restoreDraft(ownerId, { message: '', attachments: usable })
+      return
+    }
     setAttachments((items) => {
       const paths = new Set(items.map((item) => item.path))
       return [...items, ...usable.filter((item) => !paths.has(item.path))]
     })
-  }, [])
+  }, [restoreDraft])
 
   const addAttachments = async () => {
+    const ownerId = draftSessionIdRef.current
     const result = await api.pickAttachments()
     if (result.canceled) return
     if (!result.ok) {
       showError(result.error?.message || 'Could not attach those files.')
       return
     }
-    addAttachmentItems(result.attachments)
+    addAttachmentItems(result.attachments, ownerId)
   }
 
   const removeAttachment = (filePath) => {
@@ -2364,16 +2408,18 @@ function App() {
   const addDroppedFiles = async (files) => {
     const list = Array.from(files || [])
     if (!list.length) return
+    const ownerId = draftSessionIdRef.current
     const dropped = await Promise.all(list.map(async (file) => ({
       type: 'file',
       path: api.getPathForFile(file),
       displayName: file.name,
       thumbnail: await readImageThumbnail(file),
     })))
-    addAttachmentItems(dropped)
+    addAttachmentItems(dropped, ownerId)
   }
 
   const addPastedImages = async (files) => {
+    const ownerId = draftSessionIdRef.current
     for (const file of files) {
       const existingPath = api.getPathForFile?.(file)
       if (existingPath) {
@@ -2382,7 +2428,7 @@ function App() {
           path: existingPath,
           displayName: file.name || existingPath,
           thumbnail: await readImageThumbnail(file),
-        }])
+        }], ownerId)
         continue
       }
       const buffer = await file.arrayBuffer()
@@ -2393,7 +2439,7 @@ function App() {
         continue
       }
       const thumbnail = await readImageThumbnail(file)
-      addAttachmentItems([{ ...result.attachment, thumbnail }])
+      addAttachmentItems([{ ...result.attachment, thumbnail }], ownerId)
     }
   }
 
@@ -2474,9 +2520,17 @@ function App() {
         optimistic: true,
       }])
     }
-    const result = await api.sendMessage({ sessionId, prompt, attachments: outgoing })
-    if (!result.ok) {
-      patchSessionState(sessionId, { working: false })
+    // A rejected call, not just a failed one, has to land here too. The queue hands its head to
+    // this function and drops it immediately, so anything that escapes uncaught takes the user's
+    // text with it and leaves the session insisting it is still working.
+    let result
+    try {
+      result = await api.sendMessage({ sessionId, prompt, attachments: outgoing })
+    } catch (error) {
+      result = { ok: false, error: { message: error?.message || String(error) } }
+    }
+    if (!result?.ok) {
+      patchSessionState(sessionId, { working: false, turnOutcome: 'failed' })
       restoreDraft(sessionId, { message: prompt, attachments: sentAttachments })
       if (selectedIdRef.current === sessionId) {
         setMessages((items) => items.map((item) => (
@@ -2638,11 +2692,20 @@ function App() {
 
   // Slash commands are not prompts. The runtime resolves them and either hands back text to
   // print or a prompt it wants the agent to run, so they never reach the model verbatim.
-  const runSlashCommand = useCallback(async (sessionId, raw) => {
+  // `wasWorking` says whether a turn was already running when this was invoked. A few built-ins
+  // are allowed mid-turn, and those must hand the session back exactly as they found it rather
+  // than reporting the agent's turn as over and taking the stop control away with it.
+  const runSlashCommand = useCallback(async (sessionId, raw, wasWorking) => {
     const parsed = parseSlashInput(raw)
     if (!parsed) return false
     const known = findCommand(parsed.name)
     if (!known) return false
+    // Restores the pre-existing turn instead of ending it. When nothing was running, this is
+    // the ordinary end of the short turn the command itself opened.
+    const settle = (outcome) => {
+      if (wasWorking) patchSessionState(sessionId, { working: true })
+      else patchSessionState(sessionId, { working: false, ...(outcome ? { turnOutcome: outcome } : {}) })
+    }
 
     setMessages((items) => [...items, {
       id: `local-${crypto.randomUUID()}`,
@@ -2652,13 +2715,20 @@ function App() {
       status: 'sent',
       commandEcho: true,
     }])
-    patchSessionState(sessionId, {
-      working: true, turnStartedAt: Date.now(), turnEndedAt: 0, turnOutcome: '',
-    })
+    if (!wasWorking) {
+      patchSessionState(sessionId, {
+        working: true, turnStartedAt: Date.now(), turnEndedAt: 0, turnOutcome: '',
+      })
+    }
 
-    const result = await api.invokeCommand({ sessionId, name: known.name, input: parsed.input })
+    let result
+    try {
+      result = await api.invokeCommand({ sessionId, name: known.name, input: parsed.input })
+    } catch (error) {
+      result = { ok: false, error: { message: error?.message || String(error) } }
+    }
     if (!result?.ok) {
-      patchSessionState(sessionId, { working: false })
+      settle('failed')
       showError(result?.error?.message || `Could not run /${known.name}.`)
       return true
     }
@@ -2670,8 +2740,10 @@ function App() {
       return true
     }
 
-    patchSessionState(sessionId, { working: false })
-    if (result.outcome === 'text' && result.text) {
+    settle('')
+    // The transcript on screen belongs to whichever chat is open now. A slow command whose
+    // answer arrives after the user has moved on must not print into the chat they moved to.
+    if (result.outcome === 'text' && result.text && selectedIdRef.current === sessionId) {
       setMessages((items) => [...items, {
         id: `local-${crypto.randomUUID()}`,
         role: 'assistant',
@@ -2708,7 +2780,7 @@ function App() {
       }
       clearDraft(sessionId)
       setError(null)
-      runSlashCommand(sessionId, typedPrompt)
+      runSlashCommand(sessionId, typedPrompt, working)
       return
     }
 
@@ -2821,7 +2893,10 @@ function App() {
     // Derive from the current list, not from inside the setState updater: that updater
     // runs during the next render, long after the fallback below needs the answer.
     const remaining = sessions.filter((session) => !gone.has(session.id))
-    setSessions(remaining)
+    // The list itself is still updated functionally. Replacing it with the line above would
+    // also erase any chat started while a bulk cleanup was running, since that closure was
+    // captured before the new chat existed.
+    setSessions((current) => current.filter((session) => !gone.has(session.id)))
     setPinnedSessionIds((items) => items.filter((id) => !gone.has(id)))
     setOwnedSessionIds((items) => (items ? items.filter((id) => !gone.has(id)) : items))
     setPermissions((items) => items.filter((item) => !gone.has(item.sessionId)))
@@ -3351,7 +3426,11 @@ function App() {
                   ? `${quotaSnapshot.usedRequests.toLocaleString()} / ${quotaSnapshot.entitlementRequests.toLocaleString()}`
                   : '...'}
               </strong>
-              <small>{quotaSnapshot ? `${quotaSnapshot.remainingPercentage.toFixed(1)}% left` : 'Loading usage'}</small>
+              <small>
+                {quotaSnapshot
+                  ? `${quotaSnapshot.remainingPercentage.toFixed(1)}% left`
+                  : (quotaFailed ? 'Usage unavailable' : 'Loading usage')}
+              </small>
             </div>
             <div className="credit-ring">
               <svg viewBox="0 0 36 36">

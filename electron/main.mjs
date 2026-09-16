@@ -68,6 +68,8 @@ const MIN_WINDOW_WIDTH = 940
 const MIN_WINDOW_HEIGHT = 650
 // How long a tidy shutdown gets before the app stops waiting and quits anyway.
 const QUIT_TIMEOUT_MS = 4000
+// How long the last resort kill gets before the app leaves regardless.
+const FORCE_STOP_TIMEOUT_MS = 1500
 
 function appendLog(message) {
   try {
@@ -346,12 +348,16 @@ async function resumeSession(sessionId) {
   return attempt
 }
 
+// Returns null when the read fails rather than an error-shaped object. Handing that object back
+// as if it were quota data left the renderer showing "Loading usage" for ever, which reads as a
+// slow network rather than a read that already failed and will not retry itself.
 async function getQuota(copilot) {
   try {
     const result = await copilot.rpc.account.getQuota({})
     return result.quotaSnapshots
   } catch (error) {
-    return { error: serializeError(error) }
+    appendLog(`could not read quota: ${serializeError(error)?.message || 'unknown error'}`)
+    return null
   }
 }
 
@@ -903,14 +909,19 @@ ipcMain.handle('copilot:delete-session', async (_event, sessionId) => {
 })
 
 ipcMain.handle('app:open-external', async (_event, url) => {
+  // Every failure used to come back as a bare false, so a link that did nothing gave neither
+  // the user nor the log any idea why.
   try {
-    if (typeof url !== 'string') return { ok: false }
+    if (typeof url !== 'string') return { ok: false, error: { message: 'No link was given.' } }
     const parsed = new URL(url)
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { ok: false }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { ok: false, error: { message: `Only web links can be opened, not ${parsed.protocol}` } }
+    }
     await shell.openExternal(parsed.toString())
     return { ok: true }
-  } catch {
-    return { ok: false }
+  } catch (error) {
+    appendLog(`could not open external link: ${error?.message || String(error)}`)
+    return { ok: false, error: serializeError(error) }
   }
 })
 
@@ -1111,6 +1122,32 @@ async function buildWindow() {
     saveWindowBoundsSync()
   })
 
+  // The preload bridge can read local files, open paths and attach anything on disk to a
+  // Copilot session. Nothing in this app should ever navigate away from its own page, so any
+  // attempt to is refused rather than handed that bridge. Links go to the real browser, which
+  // has no such powers.
+  const isOwnPage = (target) => {
+    try {
+      const url = new URL(target)
+      if (isDev) return url.origin === 'http://127.0.0.1:5173'
+      return url.protocol === 'file:'
+    } catch {
+      return false
+    }
+  }
+
+  mainWindow.webContents.on('will-navigate', (navigationEvent, url) => {
+    if (isOwnPage(url)) return
+    navigationEvent.preventDefault()
+    appendLog(`blocked navigation to ${url}`)
+    if (/^https?:$/.test(new URL(url).protocol)) shell.openExternal(url).catch(() => {})
+  })
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) shell.openExternal(url).catch(() => {})
+    return { action: 'deny' }
+  })
+
   if (isDev) {
     await mainWindow.loadURL('http://127.0.0.1:5173')
   } else {
@@ -1246,7 +1283,12 @@ app.on('before-quit', async (event) => {
   // Cmd+Q looked like it had been ignored. Shutdown is tidy when it can be and prompt regardless.
   const forceExit = setTimeout(() => {
     appendLog('shutdown took too long, quitting anyway')
-    app.exit(0)
+    // The SDK spawns the Copilot runtime as a child process, and on macOS a child is not
+    // guaranteed to die with its parent. Exiting on the timeout alone left that runtime behind,
+    // still holding its resources, with nothing on screen to say so. Kill it first, and do not
+    // let this last effort keep the app open either.
+    currentClient.forceStop?.().catch(() => {}).finally(() => app.exit(0))
+    setTimeout(() => app.exit(0), FORCE_STOP_TIMEOUT_MS).unref?.()
   }, QUIT_TIMEOUT_MS)
   forceExit.unref?.()
 
@@ -1256,7 +1298,13 @@ app.on('before-quit', async (event) => {
     unsubscribe()
     return session.disconnect().catch(() => {})
   }))
-  await currentClient.stop().catch((e) => appendLog(`copilot client stop failed: ${e?.message || String(e)}`))
+  // stop() reports per step failures by resolving with them rather than throwing, so a shutdown
+  // that quietly failed was being logged as a clean one.
+  const stopErrors = await currentClient.stop()
+    .catch((e) => [e])
+  if (Array.isArray(stopErrors) && stopErrors.length) {
+    appendLog(`copilot client stopped with ${stopErrors.length} cleanup error(s): ${stopErrors.map((e) => e?.message || String(e)).join('; ')}`)
+  }
   clearTimeout(forceExit)
   appendLog('copilot client stopped, quitting')
   app.exit(0)
