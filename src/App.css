@@ -1509,12 +1509,184 @@ button {
   flex-direction: column;
 }
 
-.background-hud {
+/* Plan and background work are both "things happening that the transcript does not show", so
+   they share one floating column instead of competing for the same corner. */
+.hud-stack {
   position: absolute;
   top: 12px;
   right: 16px;
   z-index: 6;
   width: 262px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.hud-stack > * {
+  pointer-events: auto;
+}
+
+.plan-hud {
+  padding: 9px 11px 11px;
+  border: 1px solid #e1dfda;
+  border-radius: 12px;
+  background: rgba(253, 252, 250, .96);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 10px 28px rgba(48, 47, 43, .11);
+}
+
+.plan-hud-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #6f6c66;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.plan-marker {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #cbc7bf;
+}
+
+.plan-marker.live {
+  background: #b8926a;
+  animation: dot-blink 1.4s ease-in-out infinite;
+}
+
+/* The count is the answer to the question the panel exists for, so it is the one thing in the
+   head allowed any weight. */
+.plan-count {
+  margin-left: auto;
+  color: #8d8a83;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: none;
+}
+
+.plan-count strong {
+  color: #3b3934;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.plan-chevron {
+  flex-shrink: 0;
+  color: #a5a099;
+  transition: transform .18s ease;
+}
+
+.plan-chevron.open {
+  transform: rotate(180deg);
+}
+
+/* One mark per step. Counting what is left is the point, so this is never a percentage. */
+.plan-track {
+  display: flex;
+  gap: 3px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-track li {
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  background: #e5e2dc;
+}
+
+.plan-track li.done {
+  background: #4a7a5c;
+}
+
+.plan-track li.current {
+  background: #b8926a;
+}
+
+.plan-track li.blocked {
+  background: #a24e43;
+}
+
+.plan-current {
+  margin: 8px 0 0;
+  color: #3b3934;
+  font-size: 11.5px;
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 228px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.plan-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 3px 2px;
+  color: #8d8a83;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.plan-list li svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.plan-list li.done {
+  color: #9a968e;
+}
+
+.plan-list li.done svg {
+  color: #4a7a5c;
+}
+
+.plan-list li.current {
+  color: #3b3934;
+}
+
+.plan-list li.current svg {
+  color: #b8926a;
+}
+
+.plan-list li.blocked svg {
+  color: #a24e43;
+}
+
+.plan-bullet {
+  flex-shrink: 0;
+  width: 4px;
+  height: 4px;
+  margin: 6px 3.5px 0;
+  border-radius: 50%;
+  background: #cfcbc3;
+}
+
+.background-hud {
   padding: 9px 11px 11px;
   border: 1px solid #e1dfda;
   border-radius: 12px;

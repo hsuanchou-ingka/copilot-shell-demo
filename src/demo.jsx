@@ -62,6 +62,7 @@ const ok = (extra = {}) => Promise.resolve({ ok: true, ...extra })
 
 // Background agents come from the runtime task registry, so scenes set this to stage them.
 let mockTasks = []
+let mockTodos = []
 
 window.copilot = {
   initialize: () => ok({
@@ -79,6 +80,7 @@ window.copilot = {
   openSession: () => ok({ events: EVENTS, currentModel: { modelId: 'claude-opus-5' } }),
   listCommands: () => ok({ commands: [] }),
   listTasks: () => ok({ tasks: mockTasks }),
+  readTodos: () => ok({ todos: mockTodos }),
   instructionFiles: () => ok({ files: [{ label: 'AGENTS.md' }, { label: 'Brand guidelines' }, { label: 'Token naming rules' }] }),
   refreshQuota: () => ok({ quota: null }),
   probeBackground: () => ok({
@@ -168,6 +170,27 @@ const SCENES = {
 
   resources() {
     document.querySelector('.rail-toggle')?.click()
+  },
+
+  plan() {
+    mockTodos = [
+      { id: 'a', title: 'Audit every icon that still ships at a single scale', status: 'done' },
+      { id: 'b', title: 'Agree the export naming with the platform team', status: 'done' },
+      { id: 'c', title: 'Add the missing 2x and 3x artboards', status: 'done' },
+      { id: 'd', title: 'Wire the export panel to the new naming rules', status: 'in_progress' },
+      { id: 'e', title: 'Replace the hardcoded greys in the navigation rail', status: 'pending' },
+      { id: 'f', title: 'Check contrast on the dark surfaces', status: 'pending' },
+      { id: 'g', title: 'Write the handoff note for engineering', status: 'pending' },
+      { id: 'h', title: 'Open the pull request against the design system', status: 'pending' },
+    ]
+    startWork()
+    // The app re-reads the plan on the runtime's signal, so the scene has to send it.
+    emit({ type: 'session.todos_changed', data: {} })
+  },
+
+  planOpen() {
+    SCENES.plan()
+    window.setTimeout(() => document.querySelector('.plan-hud-head')?.click(), 500)
   },
 
   permission() {

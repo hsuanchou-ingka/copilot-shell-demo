@@ -306,17 +306,36 @@ function attachSession(session) {
   return session
 }
 
+// Resuming a session more than once is not harmless: the runtime only delivers events to the
+// most recently resumed handle, and every earlier one goes silent while still accepting sends.
+// Selecting a chat fires several IPC calls at once, all of which need a session, so without a
+// lock they each resume their own handle. The one we subscribed to is then usually not the one
+// receiving events, and the chat looks frozen mid-turn: no reply, no tool activity, and a
+// spinner that never stops because the event that ends the turn is delivered to a handle nobody
+// is listening to. So a resume already in flight is shared rather than repeated.
+const resumingSessions = new Map()
+
 async function resumeSession(sessionId) {
   const active = activeSessions.get(sessionId)
   if (active) return active.session
 
-  const copilot = await getClient()
-  const session = await copilot.resumeSession(sessionId, {
-    ...await sharedSessionConfig(),
-    streaming: true,
-    onPermissionRequest: requestPermission,
+  const pending = resumingSessions.get(sessionId)
+  if (pending) return pending
+
+  const attempt = (async () => {
+    const copilot = await getClient()
+    const session = await copilot.resumeSession(sessionId, {
+      ...await sharedSessionConfig(),
+      streaming: true,
+      onPermissionRequest: requestPermission,
+    })
+    return attachSession(session)
+  })().finally(() => {
+    resumingSessions.delete(sessionId)
   })
-  return attachSession(session)
+
+  resumingSessions.set(sessionId, attempt)
+  return attempt
 }
 
 async function getQuota(copilot) {
@@ -598,6 +617,26 @@ ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attac
       ...(safeAttachments.length ? { attachments: safeAttachments } : {}),
     })
     return { ok: true, messageId }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('copilot:read-todos', async (_event, sessionId) => {
+  try {
+    const session = await resumeSession(sessionId)
+    // The plain read, not the one that also returns dependency edges. The panel answers
+    // "how many are left and which one is live", and a dependency graph does not help with that.
+    const result = await session.rpc.plan.readSqlTodos()
+    // Every column is best effort, so anything without a title is not worth a row.
+    const todos = (result?.rows || [])
+      .filter((row) => row?.title)
+      .map((row) => ({
+        id: row.id || row.title,
+        title: row.title,
+        status: (row.status || 'pending').toLowerCase(),
+      }))
+    return { ok: true, todos }
   } catch (error) {
     return { ok: false, error: serializeError(error) }
   }

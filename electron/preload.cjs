@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('copilot', {
   sendMessage: (options) => ipcRenderer.invoke('copilot:send-message', options),
   listCommands: (sessionId) => ipcRenderer.invoke('copilot:list-commands', sessionId),
   listTasks: (sessionId) => ipcRenderer.invoke('copilot:list-tasks', sessionId),
+  readTodos: (sessionId) => ipcRenderer.invoke('copilot:read-todos', sessionId),
   invokeCommand: (options) => ipcRenderer.invoke('copilot:invoke-command', options),
   abortSession: (sessionId) => ipcRenderer.invoke('copilot:abort-session', sessionId),
   pickAttachments: () => ipcRenderer.invoke('copilot:pick-attachments'),

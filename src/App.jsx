@@ -50,9 +50,15 @@ const EMPTY_SESSION_STATE = {
 }
 const EMPTY_QUEUE = []
 const EMPTY_TASKS = []
+const EMPTY_TODOS = []
 
 const KEEP_WORKING_PROMPT = 'keep working'
 const EMPTY_TASK_SNAPSHOT = { sessionId: null, tasks: EMPTY_TASKS }
+const EMPTY_PLAN = { sessionId: null, todos: EMPTY_TODOS }
+
+// A plan of one step is not a plan, and showing it would put a panel on screen for work that
+// needs no explaining.
+const PLAN_MIN_STEPS = 2
 
 // Task identity plus intent is everything the panel renders, so comparing those is enough to
 // tell a meaningless poll from a real change.
@@ -60,6 +66,24 @@ function sameTaskList(a, b) {
   if (a === b) return true
   if (a.length !== b.length) return false
   return a.every((task, index) => task.id === b[index].id && task.intent === b[index].intent)
+}
+
+function sameTodoList(a, b) {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  return a.every((todo, index) => todo.id === b[index].id
+    && todo.status === b[index].status
+    && todo.title === b[index].title)
+}
+
+// The runtime writes whatever the agent put in the status column, so anything unrecognised is
+// treated as still to do rather than dropped.
+function todoIsDone(todo) {
+  return todo.status === 'done' || todo.status === 'completed'
+}
+
+function todoIsLive(todo) {
+  return todo.status === 'in_progress' || todo.status === 'running'
 }
 const EMPTY_EDITS = Object.freeze({ hidden: [], manual: [], labels: {} })
 const PROJECT_PREVIEW_COUNT = 8
@@ -1237,6 +1261,11 @@ function App() {
   const [backgroundProbes, setBackgroundProbes] = useState({})
   const [commands, setCommands] = useState([])
   const [taskSnapshot, setTaskSnapshot] = useState(EMPTY_TASK_SNAPSHOT)
+  const [plan, setPlan] = useState(EMPTY_PLAN)
+  const [planOpen, setPlanOpen] = useState(false)
+  // Bumped by session.todos_changed so the plan re-reads on the runtime's signal rather than
+  // on a timer.
+  const [planRevision, setPlanRevision] = useState(0)
   const [paletteQuery, setPaletteQuery] = useState(null)
   const [paletteIndex, setPaletteIndex] = useState(0)
   const [tick, setTick] = useState(() => Date.now())
@@ -1491,6 +1520,47 @@ function App() {
     [backgroundShells, tasksForSession],
   )
   const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
+
+  // What the plan panel needs to answer "how far in, how much left, what is live right now".
+  // A finished plan is not shown: the panel means there is outstanding work, so it going away
+  // is how the last step reads as done.
+  const planTodos = plan.sessionId === selectedId ? plan.todos : EMPTY_TODOS
+  const planView = useMemo(() => {
+    if (planTodos.length < PLAN_MIN_STEPS) return null
+    const doneCount = planTodos.filter(todoIsDone).length
+    if (doneCount === planTodos.length) return null
+    // The step being worked on, or failing that the next one waiting, so the collapsed panel
+    // always names something real.
+    const liveIndex = planTodos.findIndex(todoIsLive)
+    const currentIndex = liveIndex === -1 ? planTodos.findIndex((todo) => !todoIsDone(todo)) : liveIndex
+    return {
+      todos: planTodos,
+      total: planTodos.length,
+      doneCount,
+      current: planTodos[currentIndex] || null,
+      // Position is counted from what is finished, so it reads as "on step 4 of 8" even when
+      // the agent has not marked anything in progress.
+      position: Math.min(planTodos.length, doneCount + 1),
+      live: liveIndex !== -1,
+    }
+  }, [planTodos])
+
+  // The plan is read on the runtime's signal rather than on a timer: session.todos_changed
+  // fires whenever the agent writes to its todo list, and planRevision carries that through.
+  useEffect(() => {
+    if (!api?.readTodos || !selectedId) return undefined
+    let cancelled = false
+    api.readTodos(selectedId).then((result) => {
+      if (cancelled) return
+      const next = result?.ok ? result.todos : EMPTY_TODOS
+      setPlan((current) => (
+        current.sessionId === selectedId && sameTodoList(current.todos, next)
+          ? current
+          : { sessionId: selectedId, todos: next }
+      ))
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [api, selectedId, planRevision])
 
   // Poll the runtime task registry for this chat. agentHint bumps the poll the moment a
   // background agent starts, so the panel appears immediately instead of on the next tick.
@@ -1846,6 +1916,11 @@ function App() {
       // A new turn clears the debounce above, so a turn that starts and ends quickly still
       // registers its own ending rather than being mistaken for an echo of the previous one.
       if (event.type === 'model.turn_started') turnEndedAtRef.current[sessionId] = 0
+      // Signal-only event: the plan changed and has to be re-read. Only the visible chat needs
+      // to react, since the panel reads for whichever chat is selected.
+      if (event.type === 'session.todos_changed' && isSelected) {
+        setPlanRevision((value) => value + 1)
+      }
 
       if (event.type === 'assistant.message_delta') {
         patchSessionState(sessionId, (current) => ({
@@ -1915,11 +1990,11 @@ function App() {
         }
       }
       if (event.type === 'session.error') {
-        patchSessionState(sessionId, { working: false, backgroundAgents: [] })
-        queuesRef.current = Object.fromEntries(
-          Object.entries(queuesRef.current).filter(([key]) => key !== sessionId),
-        )
-        setQueues({ ...queuesRef.current })
+        // Most of these are recoverable: rate limits, quota, context limits, a bad query. The
+        // runtime may even switch model and carry on. Deleting the queue here threw away
+        // messages the user had already written over a blip they never chose, so the queue
+        // stays. It is visible in the composer, so they can send it, edit it or drop it.
+        patchSessionState(sessionId, { working: false, liveText: '', toolActivity: [] })
         if (isSelected) showError(event.data?.message || 'The Copilot session reported an error.')
       }
     })
@@ -2636,6 +2711,8 @@ function App() {
     })
     gone.forEach((id) => {
       delete draftsRef.current[id]
+      delete lastEventAtRef.current[id]
+      delete turnEndedAtRef.current[id]
       writeQueue(id, [])
     })
     if (gone.has(selectedIdRef.current)) {
@@ -3345,6 +3422,60 @@ function App() {
         )}
 
         <div className="conversation-area">
+        <div className="hud-stack">
+        {planView && (
+          <section className="plan-hud" aria-label="Plan for this chat">
+            <button
+              type="button"
+              className="plan-hud-head"
+              onClick={() => setPlanOpen((open) => !open)}
+              aria-expanded={planOpen}
+            >
+              <span className={`plan-marker${planView.live ? ' live' : ''}`} aria-hidden="true" />
+              Plan
+              <span className="plan-count">
+                <strong>{planView.position}</strong> of {planView.total}
+              </span>
+              <ChevronDown size={13} className={`plan-chevron${planOpen ? ' open' : ''}`} />
+            </button>
+
+            {/* One mark per step, so what is left can be counted rather than inferred from a
+                percentage that would be invented. This is the whole point of the panel. */}
+            <ol className="plan-track" aria-hidden="true">
+              {planView.todos.map((todo, index) => {
+                const state = todoIsDone(todo) ? 'done'
+                  : todo.id === planView.current?.id ? 'current'
+                    : todo.status === 'blocked' ? 'blocked' : 'todo'
+                return <li key={todo.id || index} className={state} />
+              })}
+            </ol>
+
+            {planOpen ? (
+              <ol className="plan-list">
+                {planView.todos.map((todo, index) => {
+                  const done = todoIsDone(todo)
+                  const current = todo.id === planView.current?.id
+                  return (
+                    <li
+                      key={todo.id || index}
+                      className={done ? 'done' : current ? 'current' : todo.status === 'blocked' ? 'blocked' : ''}
+                    >
+                      {done
+                        ? <Check size={11} />
+                        : current
+                          ? <LoaderCircle size={11} className={planView.live ? 'spin' : ''} />
+                          : <span className="plan-bullet" aria-hidden="true" />}
+                      <span>{todo.title}</span>
+                    </li>
+                  )
+                })}
+              </ol>
+            ) : (
+              planView.current && <p className="plan-current">{planView.current.title}</p>
+            )}
+          </section>
+        )}
+
         {backgroundAgents.length > 0 && (
           <aside className="background-hud" aria-label="Background work in this chat">
             <div className="background-hud-head">
@@ -3393,6 +3524,7 @@ function App() {
             </div>
           </aside>
         )}
+        </div>
         <div
           className={`conversation ${draggingFiles ? 'dragging-files' : ''}`}
           ref={conversationRef}
@@ -3543,7 +3675,7 @@ function App() {
             {!!selectedQueue.length && (
               <div className="queue-strip">
                 <div className="queue-heading">
-                  Queued · sends when this turn finishes
+                  {working ? 'Queued · sends when this turn finishes' : 'Queued · sends with your next message'}
                 </div>
                 {selectedQueue.map((item, index) => (
                   <div className="queue-item" key={item.id}>
