@@ -562,6 +562,72 @@ button {
   font-size: 11px;
 }
 
+.session-filter-toggle {
+  margin-left: auto;
+  margin-right: 7px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #99958d;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: .02em;
+  text-transform: none;
+  cursor: pointer;
+}
+
+.session-filter-toggle:hover {
+  border-color: #e1dfda;
+  background: var(--hover);
+  color: #6f6c66;
+}
+
+.session-filter-toggle.on {
+  border-color: #ddd0bd;
+  background: #f6efe5;
+  color: #8d7355;
+}
+
+.session-cleanup-button {
+  margin-right: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #99958d;
+  cursor: pointer;
+}
+
+.session-cleanup-button:hover {
+  border-color: #e7cfc9;
+  background: #fbf0ee;
+  color: #b4544a;
+}
+
+.session-external-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  background: #efece6;
+  color: #8d8a83;
+}
+
+.session-row.external .session-copy strong {
+  color: #7d7a74;
+  font-weight: 500;
+}
+
 .session-list {
   min-height: 0;
   padding: 0 8px 12px;
@@ -1432,9 +1498,20 @@ button {
 
 /* Pinned to the top right of the chat, so background work stays visible without stealing
    room from the conversation. It floats above the thread rather than pushing it down. */
+/* Holds the transcript and anything that floats over it. Being its own positioned box means
+   the background list can sit at its top edge without needing to know how tall the header and
+   the resource rail happen to be. */
+.conversation-area {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .background-hud {
   position: absolute;
-  top: 74px;
+  top: 12px;
   right: 16px;
   z-index: 6;
   width: 262px;
@@ -1556,6 +1633,10 @@ button {
   opacity: 0.5;
 }
 
+/* The bar is always present while work runs, because its real job is to answer "is anything
+   happening" at a glance. A percentage fills it; without one it sweeps instead. A sweeping bar
+   is the standard way to say "running, duration unknown", so it claims nothing it does not
+   know. What would lie is a solid fill parked at some invented fraction. */
 .background-bar {
   height: 3px;
   border-radius: 2px;
@@ -1570,6 +1651,26 @@ button {
   border-radius: 2px;
   background: #b8926a;
   transition: width 0.4s ease;
+}
+
+.background-bar span.indeterminate {
+  width: 38%;
+  transition: none;
+  animation: bar-sweep 1.5s ease-in-out infinite;
+}
+
+@keyframes bar-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(363%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .background-bar span.indeterminate {
+    width: 100%;
+    opacity: .34;
+    animation: none;
+    transform: none;
+  }
 }
 
 @keyframes ring-breathe {
@@ -1626,11 +1727,18 @@ button {
   font-size: 11px;
 }
 
-.jump-latest {
+.conversation-jumps {
   position: absolute;
   right: 40px;
   bottom: 132px;
   z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.jump-latest,
+.jump-mine {
   height: 30px;
   padding: 0 12px;
   display: flex;
@@ -1646,8 +1754,19 @@ button {
   font-weight: 650;
 }
 
-.jump-latest:hover {
+.jump-latest:hover,
+.jump-mine:hover {
   background: #f7f6f2;
+}
+
+.message.user.located .markdown {
+  animation: turn-located 1.8s ease-out;
+}
+
+@keyframes turn-located {
+  0% { box-shadow: 0 0 0 3px rgba(180, 142, 74, .45); }
+  70% { box-shadow: 0 0 0 3px rgba(180, 142, 74, .26); }
+  100% { box-shadow: 0 0 0 3px rgba(180, 142, 74, 0); }
 }
 
 .toolkit-backdrop {
@@ -2314,6 +2433,7 @@ button {
   gap: 6px;
 }
 
+.composer-actions .keep-working,
 .composer-actions .stop {
   width: auto;
   height: 27px;
@@ -2334,6 +2454,17 @@ button {
   background: #f5e9e7;
   border-color: #d8b9b4;
   color: #a24e43;
+}
+
+.composer-actions .keep-working {
+  color: #6f6a62;
+  font-weight: 600;
+}
+
+.composer-actions .keep-working:hover {
+  background: #f6f1e8;
+  border-color: #cdb392;
+  color: #8a6a3d;
 }
 
 .composer-actions .send.queueing {
@@ -3190,4 +3321,102 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* One line, not two. This is ambient detail you glance at, and letting each running item grow
+   to two lines makes a busy chat push the panel down over the transcript. The full text is in
+   the title attribute. A span is inline, where overflow and text-overflow do nothing, so it
+   has to be blockified for the ellipsis to appear. */
+.background-intent {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #8c877e;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.cleanup-dialog {
+  width: min(560px, calc(100vw - 40px));
+}
+
+.cleanup-toolbar {
+  margin: 14px 0 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.cleanup-toolbar button {
+  padding: 4px 10px;
+  border: 1px solid #ddd9d2;
+  border-radius: 7px;
+  background: #fff;
+  color: #55524d;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cleanup-toolbar button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.cleanup-toolbar button:disabled {
+  opacity: .5;
+  cursor: default;
+}
+
+.cleanup-toolbar small {
+  color: #8b877f;
+  font-size: 11.5px;
+}
+
+.cleanup-list {
+  max-height: 260px;
+  border: 1px solid #e4e1db;
+  border-radius: 10px;
+  background: #fff;
+  overflow-y: auto;
+}
+
+.cleanup-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #f1efeb;
+  cursor: pointer;
+}
+
+.cleanup-row:last-child {
+  border-bottom: none;
+}
+
+.cleanup-row:hover {
+  background: #faf9f7;
+}
+
+.cleanup-row input {
+  flex: none;
+  margin: 0;
+  accent-color: #b4544a;
+}
+
+.cleanup-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #3d3a35;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cleanup-row small {
+  flex: none;
+  color: #99958d;
+  font-size: 11px;
 }

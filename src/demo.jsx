@@ -60,6 +60,9 @@ let ask = null
 const noop = () => () => {}
 const ok = (extra = {}) => Promise.resolve({ ok: true, ...extra })
 
+// Background agents come from the runtime task registry, so scenes set this to stage them.
+let mockTasks = []
+
 window.copilot = {
   initialize: () => ok({
     auth: { login: 'demo-user' },
@@ -75,12 +78,13 @@ window.copilot = {
   }),
   openSession: () => ok({ events: EVENTS, currentModel: { modelId: 'claude-opus-5' } }),
   listCommands: () => ok({ commands: [] }),
+  listTasks: () => ok({ tasks: mockTasks }),
   instructionFiles: () => ok({ files: [{ label: 'AGENTS.md' }, { label: 'Brand guidelines' }, { label: 'Token naming rules' }] }),
   refreshQuota: () => ok({ quota: null }),
   probeBackground: () => ok({
     report: {
-      icons: { shellId: 'icons', percent: 62, eta: '40s', finished: false },
-      contrast: { shellId: 'contrast', percent: null, finished: false },
+      icons: { shellId: 'icons', percent: 62, eta: '40s', finished: false, line: '62%|████████  | 124/200 [00:38<00:40, 1.9it/s]' },
+      contrast: { shellId: 'contrast', percent: null, finished: false, line: 'checking components/navigation/rail.tsx' },
     },
   }),
   createSession: () => ok(),
@@ -240,6 +244,13 @@ const SCENES = {
         result: { content: '<command started in detached background with shellId: contrast>' },
       },
     })
+    mockTasks = [{
+      id: 'task-1',
+      type: 'agent',
+      name: 'Audit the empty states',
+      intent: 'Reading components/states/empty.tsx',
+      startedAt: Date.now() - 48000,
+    }]
     startWork()
   },
 }

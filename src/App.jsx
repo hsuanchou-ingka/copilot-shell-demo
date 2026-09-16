@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import {
   AlertTriangle,
   ArrowDown,
+  CornerUpLeft,
   Check,
   CheckCheck,
   ChevronDown,
@@ -13,6 +14,7 @@ import {
   Download,
   ExternalLink,
   Eye,
+  EyeOff,
   Folder,
   FolderPlus,
   GitFork,
@@ -29,6 +31,7 @@ import {
   Send,
   Smartphone,
   Sparkles,
+  RotateCw,
   Square,
   Tablet,
   TerminalSquare,
@@ -43,8 +46,21 @@ const EMPTY_SESSION_STATE = {
   toolActivity: [],
   backgroundAgents: [],
   pendingTools: {},
+  agentHint: null,
 }
 const EMPTY_QUEUE = []
+const EMPTY_TASKS = []
+
+const KEEP_WORKING_PROMPT = 'keep working'
+const EMPTY_TASK_SNAPSHOT = { sessionId: null, tasks: EMPTY_TASKS }
+
+// Task identity plus intent is everything the panel renders, so comparing those is enough to
+// tell a meaningless poll from a real change.
+function sameTaskList(a, b) {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  return a.every((task, index) => task.id === b[index].id && task.intent === b[index].intent)
+}
 const EMPTY_EDITS = Object.freeze({ hidden: [], manual: [], labels: {} })
 const PROJECT_PREVIEW_COUNT = 8
 const ERROR_DISMISS_MS = 8000
@@ -52,6 +68,7 @@ const ERROR_DISMISS_MS = 8000
 const ALIASES_KEY = 'copilot-workbench-aliases'
 const PINS_KEY = 'copilot-workbench-pins'
 const PINNED_SESSIONS_KEY = 'copilot-workbench-pinned-sessions'
+const OWNED_SESSIONS_KEY = 'copilot-workbench-owned-sessions'
 const SELECTED_PROJECT_KEY = 'copilot-workbench-selected-project'
 const SELECTED_SESSION_KEY = 'copilot-workbench-selected-session'
 const SIDEBAR_WIDTH_KEY = 'copilot-workbench-sidebar-width'
@@ -433,7 +450,6 @@ function eventTime(event) {
 function foldBackgroundActivity(state, event) {
   const type = event?.type
   const data = event?.data || {}
-  const drop = (id) => state.backgroundAgents.filter((item) => item.id !== id)
 
   if (type === 'tool.execution_start') {
     const args = data.arguments || {}
@@ -503,43 +519,32 @@ function foldBackgroundActivity(state, event) {
   }
 
   if (type === 'subagent.started' && data.executionMode === 'background') {
-    const id = `agent:${data.toolCallId}`
-    if (!data.toolCallId || state.backgroundAgents.some((item) => item.id === id)) return state
-    return {
-      ...state,
-      backgroundAgents: [...state.backgroundAgents, {
-        id,
-        kind: 'agent',
-        name: data.agentDisplayName || data.agentName || 'Background agent',
-        detail: data.model || '',
-        startedAt: eventTime(event),
-      }],
-    }
+    // Only a hint that the runtime registry is about to change. The authoritative list comes
+    // from tasks.list, so nothing is recorded here beyond a nudge to re-poll.
+    return state.agentHint === data.toolCallId ? state : { ...state, agentHint: data.toolCallId }
   }
 
   if (type === 'subagent.completed' || type === 'subagent.failed') {
-    return { ...state, backgroundAgents: drop(`agent:${data.toolCallId}`) }
+    return state.agentHint ? { ...state, agentHint: null } : state
   }
 
   return state
 }
 
-// Replaying old logs can leave ghosts, because a session that was killed mid-run never
-// records its completion notices. Only trust a replay when the log was active recently.
-const REPLAY_FRESHNESS_MS = 30 * 60 * 1000
-
 // Ceiling for a non-detached background shell. Those report completion through the event log,
 // so once one runs this long without a notice the record is almost certainly lost.
 const UNTRACKED_SHELL_MAX_MS = 20 * 60 * 1000
 
+// Replaying history rebuilds shells only. There is no blanket staleness cutoff here, because
+// wiping the whole list whenever a chat sat quiet is what made the panel vanish on reopen.
+// Liveness is settled afterwards: detached shells by their log files, the rest by the ceiling
+// above, and background agents by the runtime task registry.
 function backgroundActivityFromEvents(events) {
   let state = { pendingTools: {}, backgroundAgents: [] }
   for (const event of events || []) state = foldBackgroundActivity(state, event)
-  const last = events?.length ? eventTime(events[events.length - 1]) : 0
-  if (Date.now() - last > REPLAY_FRESHNESS_MS) {
-    return { pendingTools: {}, backgroundAgents: [] }
-  }
-  return state
+  // A replayed subagent.started proves nothing about now, and old chats are full of agents
+  // that ended without ever recording it. Liveness comes from the registry poll instead.
+  return { ...state, agentHint: null }
 }
 
 // The palette only opens on a slash that starts the message, and it closes as soon as the
@@ -581,6 +586,21 @@ function parseSlashInput(text) {
   const space = body.search(/\s/)
   if (space < 0) return { name: body, input: '' }
   return { name: body.slice(0, space), input: body.slice(space + 1).trim() }
+}
+
+// Most commands never print a percentage, so a progress bar would be a guess. The last line
+// the command wrote is the honest version of the same answer: here is what it is doing now.
+// Carriage returns and ANSI codes are how spinners redraw in place, and they arrive as noise.
+function activityLine(text) {
+  if (typeof text !== 'string') return ''
+  const cleaned = text
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\[[0-9;?]*[a-zA-Z]/g, '')
+    .split(/[\r\n]/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .pop() || ''
+  return cleaned.length > 120 ? `${cleaned.slice(0, 119)}…` : cleaned
 }
 
 // Only draws an arc when a real percentage exists, because a partly filled donut reads as
@@ -1199,6 +1219,7 @@ function App() {
   const [sessionState, setSessionState] = useState({})
   const [backgroundProbes, setBackgroundProbes] = useState({})
   const [commands, setCommands] = useState([])
+  const [taskSnapshot, setTaskSnapshot] = useState(EMPTY_TASK_SNAPSHOT)
   const [paletteQuery, setPaletteQuery] = useState(null)
   const [paletteIndex, setPaletteIndex] = useState(0)
   const [tick, setTick] = useState(() => Date.now())
@@ -1221,6 +1242,14 @@ function App() {
   const [aliases, setAliases] = useState(() => loadValue(ALIASES_KEY, {}))
   const [pinnedPaths, setPinnedPaths] = useState(() => loadValue(PINS_KEY, []))
   const [pinnedSessionIds, setPinnedSessionIds] = useState(() => loadValue(PINNED_SESSIONS_KEY, []))
+  // Sessions started from this app. The CLI shares one session store with every other
+  // Copilot surface, so without this the sidebar fills up with terminal scratch sessions.
+  // null means "never recorded", which triggers a one-time adopt of whatever already exists.
+  const [ownedSessionIds, setOwnedSessionIds] = useState(() => loadValue(OWNED_SESSIONS_KEY, null))
+  const [showAllSessions, setShowAllSessions] = useState(false)
+  const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [cleanupSelected, setCleanupSelected] = useState([])
+  const [cleanupBusy, setCleanupBusy] = useState(null)
   const [selectedProject, setSelectedProject] = useState(() => {
     const stored = loadValue(SELECTED_PROJECT_KEY, null)
     return isFolderKey(stored) ? stored : null
@@ -1245,6 +1274,15 @@ function App() {
   const [visibleCount, setVisibleCount] = useState(80)
   const [loadingSession, setLoadingSession] = useState(false)
   const [atBottom, setAtBottom] = useState(true)
+  // Walks backwards through your own turns so a long transcript can be re-read from
+  // whatever you last asked for, rather than from wherever the scroll happens to sit.
+  const [jumpPosition, setJumpPosition] = useState(null)
+  const jumpStateRef = useRef({ index: null, count: 0, sessionId: null })
+  const jumpFiredAtRef = useRef(0)
+  const highlightedTurnRef = useRef(null)
+  const highlightTimerRef = useRef(0)
+  // The menu command handler is wired up before jumpToMyTurn exists, so it goes through a ref.
+  const jumpToMyTurnRef = useRef(null)
   const selectedIdRef = useRef(selectedId)
   const selectedModelRef = useRef(selectedModel)
   const selectedProjectRef = useRef(selectedProject)
@@ -1410,10 +1448,47 @@ function App() {
   const working = liveState.working
   // A plain background shell that gets killed never reports a completion, so it would hang
   // around forever. Detached shells are exempt: their log files tell us the real status.
-  const backgroundAgents = liveState.backgroundAgents.filter((item) => (
+  const backgroundShells = liveState.backgroundAgents.filter((item) => (
     item.kind !== 'shell' || item.detached || tick - item.startedAt < UNTRACKED_SHELL_MAX_MS
   ))
+  // Agents come from the runtime registry rather than the event log, so a finished one cannot
+  // linger and a quiet chat does not lose the ones that are genuinely still working. The
+  // snapshot carries its session id, so a poll landing after a chat switch is ignored.
+  const tasksForSession = taskSnapshot.sessionId === selectedId ? taskSnapshot.tasks : EMPTY_TASKS
+  const backgroundAgents = useMemo(
+    () => [...backgroundShells, ...tasksForSession.map((task) => ({
+      id: `task:${task.id}`,
+      kind: 'agent',
+      name: task.name,
+      detail: task.intent || '',
+      startedAt: task.startedAt,
+    }))],
+    [backgroundShells, tasksForSession],
+  )
   const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
+
+  // Poll the runtime task registry for this chat. agentHint bumps the poll the moment a
+  // background agent starts, so the panel appears immediately instead of on the next tick.
+  useEffect(() => {
+    if (!api?.listTasks || !selectedId) return undefined
+    let cancelled = false
+    const poll = () => {
+      api.listTasks(selectedId).then((result) => {
+        if (cancelled) return
+        const next = result?.ok ? result.tasks : EMPTY_TASKS
+        // Replacing the array on every poll would re-render the panel each time, so only
+        // publish when something actually changed.
+        setTaskSnapshot((current) => (
+          current.sessionId === selectedId && sameTaskList(current.tasks, next)
+            ? current
+            : { sessionId: selectedId, tasks: next }
+        ))
+      }).catch(() => {})
+    }
+    poll()
+    const timer = setInterval(poll, 4000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [api, selectedId, liveState.agentHint])
 
   // The runtime owns the command list, so ask it once per session rather than guessing from
   // the skill folders. Built-ins and skills arrive together with their descriptions.
@@ -1485,7 +1560,7 @@ function App() {
 
   // Poll the detached shell logs for progress while background work is live. Only detached
   // shells write those logs, so probing anything else would read a missing file and look dead.
-  const shellIds = backgroundAgents
+  const shellIds = backgroundShells
     .filter((item) => item.kind === 'shell' && item.detached)
     .map((item) => item.detail)
     .join(',')
@@ -1558,10 +1633,35 @@ function App() {
     return preview
   }, [projects, selectedProject, showAllProjects])
 
+  // Anything not started here is "external": it came from the terminal CLI or another
+  // Copilot surface. Those stay hidden unless the user asks to see them.
+  const ownedSet = useMemo(() => new Set(ownedSessionIds || []), [ownedSessionIds])
+  const isOwnedSession = useCallback(
+    (sessionId) => !ownedSessionIds || ownedSet.has(sessionId),
+    [ownedSessionIds, ownedSet],
+  )
+
+  const scopedSessions = useMemo(
+    () => sessions.filter((session) => !selectedProject || projectKeyOf(session) === selectedProject),
+    [selectedProject, sessions],
+  )
+  const hiddenSessionCount = useMemo(
+    () => scopedSessions.filter((session) => !isOwnedSession(session.id) && session.id !== selectedId).length,
+    [isOwnedSession, scopedSessions, selectedId],
+  )
+  // The open session is left out: deleting what you are reading is never what you meant.
+  const cleanupCandidates = useMemo(
+    () => scopedSessions
+      .filter((session) => !isOwnedSession(session.id) && session.id !== selectedId)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)),
+    [isOwnedSession, scopedSessions, selectedId],
+  )
+
   const visibleSessions = useMemo(() => {
     const needle = query.trim().toLowerCase()
-    return sessions
-      .filter((session) => !selectedProject || projectKeyOf(session) === selectedProject)
+    return scopedSessions
+      // The open session always stays listed, otherwise the sidebar disagrees with the header.
+      .filter((session) => showAllSessions || isOwnedSession(session.id) || session.id === selectedId)
       .filter((session) => {
         if (!needle) return true
         const title = aliases[session.id] || session.title
@@ -1572,7 +1672,7 @@ function App() {
         if (pinDifference) return pinDifference
         return new Date(b.updatedAt) - new Date(a.updatedAt)
       })
-  }, [aliases, pinnedSessionIds, query, selectedProject, sessions])
+  }, [aliases, isOwnedSession, pinnedSessionIds, query, scopedSessions, selectedId, showAllSessions])
 
   const pinnedVisibleSessions = visibleSessions.filter((session) => pinnedSessionIds.includes(session.id))
   const regularVisibleSessions = visibleSessions.filter((session) => !pinnedSessionIds.includes(session.id))
@@ -1581,8 +1681,16 @@ function App() {
   useEffect(() => saveValue(ALIASES_KEY, aliases), [aliases])
   useEffect(() => saveValue(PINS_KEY, pinnedPaths), [pinnedPaths])
   useEffect(() => saveValue(PINNED_SESSIONS_KEY, pinnedSessionIds), [pinnedSessionIds])
+  useEffect(() => {
+    if (ownedSessionIds) saveValue(OWNED_SESSIONS_KEY, ownedSessionIds)
+  }, [ownedSessionIds])
   useEffect(() => saveValue(SELECTED_PROJECT_KEY, selectedProject), [selectedProject])
-  useEffect(() => saveValue(SELECTED_SESSION_KEY, selectedId), [selectedId])
+  // Skip the mount pass: selectedId is still null then, and writing it would erase the
+  // stored id before initialize gets a chance to read it back.
+  useEffect(() => {
+    if (!restoredSelectionRef.current) return
+    saveValue(SELECTED_SESSION_KEY, selectedId)
+  }, [selectedId])
   useEffect(() => saveValue(SIDEBAR_WIDTH_KEY, sidebarWidth), [sidebarWidth])
   useEffect(() => saveValue(PROJECTS_HEIGHT_KEY, projectsHeight), [projectsHeight])
   useEffect(() => saveValue(PROJECTS_COLLAPSED_KEY, projectsCollapsed), [projectsCollapsed])
@@ -1670,6 +1778,13 @@ function App() {
     setSelectedId(sessionId)
   }, [resetScroll])
 
+  const adoptSession = useCallback((sessionId) => {
+    if (!sessionId) return
+    setOwnedSessionIds((current) => (
+      current?.includes(sessionId) ? current : [...(current || []), sessionId]
+    ))
+  }, [])
+
   const createSession = useCallback(async (options = {}) => {
     const activeProject = selectedProjectRef.current
     const workingDirectory = options.chooseFolder || !isFolderKey(activeProject) ? '' : activeProject
@@ -1684,6 +1799,7 @@ function App() {
       return
     }
     setError(null)
+    adoptSession(result.session.id)
     setSessions((items) => [result.session, ...items])
     const directory = workingDirectoryOf(result.session)
     if (directory) setSelectedProject(directory)
@@ -1691,7 +1807,7 @@ function App() {
     setLoadingSession(true)
     resetScroll()
     setSelectedId(result.session.id)
-  }, [api, resetScroll, showError])
+  }, [adoptSession, api, resetScroll, showError])
 
   useEffect(() => {
     if (!api) {
@@ -1797,6 +1913,7 @@ function App() {
       if (command === 'new-session') createSession()
       if (command === 'new-session-folder') createSession({ chooseFolder: true })
       if (command === 'focus-search') searchInputRef.current?.focus()
+      if (command === 'jump-to-my-turn') jumpToMyTurnRef.current?.()
     })
 
     api.initialize().then((result) => {
@@ -1814,6 +1931,15 @@ function App() {
       setSelectedModel(result.models[0]?.id || 'auto')
       setReady(true)
 
+      // First launch after this feature shipped: keep every session already on disk, so
+      // upgrading never hides work. From here on only sessions started here are added.
+      let owned = loadValue(OWNED_SESSIONS_KEY, null)
+      if (!owned) {
+        owned = sorted.map((session) => session.id)
+        setOwnedSessionIds(owned)
+      }
+      const ownedIds = new Set(owned)
+
       let project = selectedProjectRef.current
       if (project && !sorted.some((session) => projectKeyOf(session) === project)) {
         project = null
@@ -1821,7 +1947,10 @@ function App() {
       }
       const pool = project ? sorted.filter((session) => projectKeyOf(session) === project) : sorted
       const storedId = loadValue(SELECTED_SESSION_KEY, null)
-      const restored = pool.find((session) => session.id === storedId) || pool[0] || null
+      // Falling back to the newest session would land on a terminal scratch session, which is
+      // the noise this filter exists to remove.
+      const mine = pool.filter((session) => ownedIds.has(session.id))
+      const restored = pool.find((session) => session.id === storedId) || mine[0] || null
       restoredSelectionRef.current = true
       if (restored) {
         setLoadingSession(true)
@@ -1865,7 +1994,7 @@ function App() {
     const current = sessions.find((session) => session.id === selectedId)
     if (current && projectKeyOf(current) === selectedProject) return
     const newest = sessions
-      .filter((session) => projectKeyOf(session) === selectedProject)
+      .filter((session) => projectKeyOf(session) === selectedProject && isOwnedSession(session.id))
       .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0]
     if (newest) {
       openSession(newest.id)
@@ -1874,7 +2003,7 @@ function App() {
     setMessages([])
     setLoadingSession(false)
     setSelectedId(null)
-  }, [openSession, selectedId, selectedProject, sessions])
+  }, [isOwnedSession, openSession, selectedId, selectedProject, sessions])
 
   useEffect(() => {
     if (!api) return
@@ -1951,7 +2080,77 @@ function App() {
     node.scrollTop = node.scrollHeight
     atBottomRef.current = true
     setAtBottom(true)
+    jumpStateRef.current = { index: null, count: 0, sessionId: null }
+    setJumpPosition(null)
   }
+
+  const jumpToMyTurn = useCallback(() => {
+    const node = conversationRef.current
+    if (!node) return
+    // The menu accelerator and the window handler can both fire for one keypress.
+    const now = Date.now()
+    if (now - jumpFiredAtRef.current < 150) return
+    jumpFiredAtRef.current = now
+
+    const turns = Array.from(node.querySelectorAll('.message.user'))
+    if (!turns.length) return
+
+    const state = jumpStateRef.current
+    const stale = state.index === null
+      || state.count !== turns.length
+      || state.sessionId !== selectedIdRef.current
+    // Each further press walks one turn back, then wraps around to the newest.
+    const index = stale || state.index <= 0 ? turns.length - 1 : state.index - 1
+    jumpStateRef.current = { index, count: turns.length, sessionId: selectedIdRef.current }
+    setJumpPosition({ index, total: turns.length, sessionId: selectedIdRef.current })
+
+    const target = turns[index]
+    const top = node.scrollTop + target.getBoundingClientRect().top - node.getBoundingClientRect().top - 24
+    node.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+
+    if (highlightedTurnRef.current) highlightedTurnRef.current.classList.remove('located')
+    highlightedTurnRef.current = target
+    window.clearTimeout(highlightTimerRef.current)
+
+    // A long transcript can take seconds to glide past, so the flash only starts once the
+    // scroll actually lands. Otherwise it is over before the message is on screen.
+    const flash = () => {
+      if (highlightedTurnRef.current !== target) return
+      target.classList.add('located')
+      highlightTimerRef.current = window.setTimeout(() => {
+        target.classList.remove('located')
+        if (highlightedTurnRef.current === target) highlightedTurnRef.current = null
+      }, 1800)
+    }
+
+    let settleTimer = 0
+    const onScrollEnd = () => {
+      window.clearTimeout(settleTimer)
+      node.removeEventListener('scrollend', onScrollEnd)
+      flash()
+    }
+    node.addEventListener('scrollend', onScrollEnd, { once: true })
+    // scrollend never fires when the position is already correct, so cap the wait.
+    settleTimer = window.setTimeout(onScrollEnd, 1200)
+  }, [])
+
+  useEffect(() => {
+    jumpToMyTurnRef.current = jumpToMyTurn
+  }, [jumpToMyTurn])
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return
+      if (event.key !== 'j' && event.key !== 'J') return
+      event.preventDefault()
+      jumpToMyTurn()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.clearTimeout(highlightTimerRef.current)
+    }
+  }, [jumpToMyTurn])
 
   const addAttachmentItems = useCallback((incoming) => {
     const usable = incoming.filter((item) => item && item.path)
@@ -2297,6 +2496,22 @@ function App() {
     deliverMessage(sessionId, prompt, sentAttachments)
   }
 
+  // A typing shortcut, nothing more. It behaves exactly as if the words had been typed into
+  // the composer and sent, including queueing behind a turn that is still running.
+  const keepWorking = () => {
+    if (!selectedId) return
+    setError(null)
+    if (working) {
+      writeQueue(selectedId, (items) => [...items, {
+        id: crypto.randomUUID(),
+        prompt: KEEP_WORKING_PROMPT,
+        attachments: [],
+      }])
+      return
+    }
+    deliverMessage(selectedId, KEEP_WORKING_PROMPT, [])
+  }
+
   const stopSession = async () => {
     if (!selectedId) return
     const result = await api.abortSession(selectedId)
@@ -2320,6 +2535,7 @@ function App() {
     }
 
     setError(null)
+    adoptSession(result.session.id)
     setSessions((items) => [result.session, ...items])
     const directory = workingDirectoryOf(result.session)
     if (directory) setSelectedProject(directory)
@@ -2336,33 +2552,35 @@ function App() {
     if (!result.ok) showError(result.error?.message || 'Could not change the model.')
   }
 
-  const deleteSession = async () => {
-    const sessionId = sessionToDelete?.id
-    if (!sessionId) return
-    const result = await api.deleteSession(sessionId)
-    if (!result.ok) {
-      showError(result.error?.message || 'Could not delete the session.')
-      return
-    }
-    const remaining = sessions.filter((session) => session.id !== sessionId)
+  // Shared by the single-row delete and the bulk cleanup so both leave the same clean state.
+  const forgetSessions = useCallback((ids) => {
+    const gone = new Set(ids)
+    if (!gone.size) return
+    // Derive from the current list, not from inside the setState updater: that updater
+    // runs during the next render, long after the fallback below needs the answer.
+    const remaining = sessions.filter((session) => !gone.has(session.id))
     setSessions(remaining)
-    setPinnedSessionIds((items) => items.filter((id) => id !== sessionId))
-    setPermissions((items) => items.filter((item) => item.sessionId !== sessionId))
+    setPinnedSessionIds((items) => items.filter((id) => !gone.has(id)))
+    setOwnedSessionIds((items) => (items ? items.filter((id) => !gone.has(id)) : items))
+    setPermissions((items) => items.filter((item) => !gone.has(item.sessionId)))
     setSessionState((current) => {
       const next = { ...current }
-      delete next[sessionId]
+      gone.forEach((id) => delete next[id])
       return next
     })
-    delete draftsRef.current[sessionId]
-    writeQueue(sessionId, [])
     setDraftAttachmentCounts((current) => {
       const next = { ...current }
-      delete next[sessionId]
+      gone.forEach((id) => delete next[id])
       return next
     })
-    if (selectedId === sessionId) {
-      const fallback = remaining.find((session) => !selectedProject || projectKeyOf(session) === selectedProject)
-        || remaining[0]
+    gone.forEach((id) => {
+      delete draftsRef.current[id]
+      writeQueue(id, [])
+    })
+    if (gone.has(selectedIdRef.current)) {
+      const stillMine = remaining.filter((session) => isOwnedSession(session.id))
+      const fallback = stillMine.find((session) => !selectedProject || projectKeyOf(session) === selectedProject)
+        || stillMine[0]
       messageRef.current = ''
       attachmentsRef.current = []
       setMessage('')
@@ -2371,8 +2589,54 @@ function App() {
       resetScroll()
       setSelectedId(fallback?.id || null)
     }
+  }, [isOwnedSession, resetScroll, selectedProject, sessions, writeQueue])
+
+  const deleteSession = async () => {
+    const sessionId = sessionToDelete?.id
+    if (!sessionId) return
+    const result = await api.deleteSession(sessionId)
+    if (!result.ok) {
+      showError(result.error?.message || 'Could not delete the session.')
+      return
+    }
+    forgetSessions([sessionId])
     setSessionToDelete(null)
   }
+
+  const runCleanup = async () => {
+    const ids = cleanupSelected.filter((id) => cleanupCandidates.some((session) => session.id === id))
+    if (!ids.length || cleanupBusy) return
+    setCleanupBusy({ done: 0, total: ids.length })
+    const removed = []
+    const failed = []
+    for (const id of ids) {
+      // Sequential on purpose: the CLI session store is a single file and parallel
+      // deletes race each other into "session not found".
+      const result = await api.deleteSession(id)
+      if (result.ok) removed.push(id)
+      else failed.push(id)
+      setCleanupBusy({ done: removed.length + failed.length, total: ids.length })
+    }
+    forgetSessions(removed)
+    setCleanupBusy(null)
+    setCleanupSelected([])
+    setCleanupOpen(false)
+    if (failed.length) {
+      showError(`Deleted ${removed.length}, but ${failed.length} could not be removed.`)
+    }
+  }
+
+  const userTurnCount = useMemo(
+    () => messages.filter((item) => item.role === 'user').length,
+    [messages],
+  )
+  // The stored position is only meaningful while the same session and turn count hold.
+  const jumpLabel = jumpPosition
+    && jumpPosition.sessionId === selectedId
+    && jumpPosition.total === userTurnCount
+    && jumpPosition.index < userTurnCount - 1
+    ? `${userTurnCount - jumpPosition.index} back`
+    : 'My last message'
 
   const activePermission = useMemo(() => {
     if (!permissions.length) return null
@@ -2415,7 +2679,16 @@ function App() {
   }
 
   const sessionIsWorking = (sessionId) => Boolean(sessionState[sessionId]?.working)
-  const sessionHasBackgroundAgents = (sessionId) => (sessionState[sessionId]?.backgroundAgents?.length || 0) > 0
+  // Shells are tracked per session from the live event stream. Agents are not, so the hint
+  // set by subagent.started stands in for them until the session is opened and polled. A live
+  // turn counts too, so glancing at the list answers "is that chat still working" for free.
+  const sessionIsBusy = (sessionId) => {
+    const state = sessionState[sessionId]
+    if (!state) return false
+    if (state.working) return true
+    if (sessionId === selectedId) return backgroundAgents.length > 0
+    return (state.backgroundAgents?.length || 0) > 0 || Boolean(state.agentHint)
+  }
   const sessionNeedsAnswer = (sessionId) => permissions.some((item) => item.sessionId === sessionId)
 
   const openRowMenu = (session, x, y) => {
@@ -2430,7 +2703,7 @@ function App() {
 
   const renderSessionRow = (session) => (
     <div
-      className={`session-row ${selectedId === session.id ? 'selected' : ''} ${rowMenu?.session.id === session.id ? 'menu-open' : ''}`}
+      className={`session-row ${selectedId === session.id ? 'selected' : ''} ${rowMenu?.session.id === session.id ? 'menu-open' : ''} ${isOwnedSession(session.id) ? '' : 'external'}`}
       key={session.id}
       onContextMenu={(event) => {
         event.preventDefault()
@@ -2453,14 +2726,19 @@ function App() {
       ) : (
         <button className="session-main" onClick={() => openSession(session.id)}>
           <span
-            className={`session-dot ${sessionHasBackgroundAgents(session.id) ? 'running' : ''}`}
-            title={sessionHasBackgroundAgents(session.id) ? 'Background work running' : undefined}
+            className={`session-dot ${sessionIsBusy(session.id) ? 'running' : ''}`}
+            title={sessionIsBusy(session.id) ? 'Working' : undefined}
             aria-hidden="true"
           />
           <span className="session-copy">
             <strong>{aliases[session.id] || session.title}</strong>
           </span>
           <span className="session-meta">
+            {!isOwnedSession(session.id) && (
+              <span className="session-external-badge" title="Started outside this app">
+                <TerminalSquare size={9} />
+              </span>
+            )}
             <small>{displayTime(session.updatedAt)}</small>
             {draftAttachmentCounts[session.id] > 0 && session.id !== selectedId && (
               <span
@@ -2640,7 +2918,37 @@ function App() {
           {query && <button onClick={() => setQuery('')}><X size={12} /></button>}
         </div>
 
-        <div className="session-label"><span>Sessions</span><small>{visibleSessions.length}</small></div>
+        <div className="session-label">
+          <span>Sessions</span>
+          {(hiddenSessionCount > 0 || showAllSessions) && (
+            <button
+              type="button"
+              className={`session-filter-toggle ${showAllSessions ? 'on' : ''}`}
+              onClick={() => setShowAllSessions((value) => !value)}
+              title={showAllSessions
+                ? 'Hide sessions that were started outside this app'
+                : `${hiddenSessionCount} session${hiddenSessionCount > 1 ? 's' : ''} started outside this app are hidden`}
+            >
+              {showAllSessions ? <EyeOff size={10} /> : <Eye size={10} />}
+              {showAllSessions ? 'Hide external' : `${hiddenSessionCount} hidden`}
+            </button>
+          )}
+          {cleanupCandidates.length > 0 && (
+            <button
+              type="button"
+              className="session-cleanup-button"
+              onClick={() => {
+                setCleanupSelected(cleanupCandidates.map((session) => session.id))
+                setCleanupOpen(true)
+              }}
+              title={`Delete ${cleanupCandidates.length} external session${cleanupCandidates.length > 1 ? 's' : ''} for good`}
+              aria-label="Clean up external sessions"
+            >
+              <Trash2 size={10} />
+            </button>
+          )}
+          <small>{visibleSessions.length}</small>
+        </div>
         <div className="session-list">
           {!!pinnedVisibleSessions.length && (
             <div className="session-group-label"><Pin size={11} /> Pinned</div>
@@ -2658,7 +2966,7 @@ function App() {
           {ready && !visibleSessions.length && (
             <div className="empty-sessions">
               <Folder size={18} />
-              <span>No sessions yet</span>
+              <span>{hiddenSessionCount > 0 ? 'No chats started here yet' : 'No sessions yet'}</span>
               <button onClick={() => createSession()}>Start a chat</button>
             </div>
           )}
@@ -2790,45 +3098,6 @@ function App() {
           </div>
         </header>
 
-        {backgroundAgents.length > 0 && (
-          <aside className="background-hud" aria-label="Background work in this chat">
-            <div className="background-hud-head">
-              <span className="background-pulse" aria-hidden="true" />
-              Running in this chat
-              <small>{backgroundAgents.length}</small>
-            </div>
-            <div className="background-hud-list">
-              {backgroundAgents.map((agent) => {
-                const probe = agent.kind === 'shell' ? backgroundProbes[agent.detail] : null
-                const percent = typeof probe?.percent === 'number' ? probe.percent : null
-                return (
-                  <div className="background-item" key={agent.id}>
-                    <Ring percent={percent} />
-                    <div className="background-item-body">
-                      <strong title={agent.name}>{agent.name}</strong>
-                      <div className="background-item-meta" key={tick}>
-                        {percent === null ? (
-                          <span>Running for {elapsedLabel(agent.startedAt)}</span>
-                        ) : (
-                          <>
-                            <span className="background-percent">{percent}%</span>
-                            <span className="background-dot-sep">·</span>
-                            <span>{probe?.eta ? `${probe.eta} left` : elapsedLabel(agent.startedAt)}</span>
-                          </>
-                        )}
-                      </div>
-                      {percent !== null && (
-                        <div className="background-bar">
-                          <span style={{ width: `${percent}%` }} />
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </aside>
-        )}
 
         {selected && (resources.length > 0 || railOpen) && (
           <div className={`resource-rail ${railOpen ? 'open' : ''}`}>
@@ -3014,6 +3283,55 @@ function App() {
           </div>
         )}
 
+        <div className="conversation-area">
+        {backgroundAgents.length > 0 && (
+          <aside className="background-hud" aria-label="Background work in this chat">
+            <div className="background-hud-head">
+              <span className="background-pulse" aria-hidden="true" />
+              Running in this chat
+              <small>{backgroundAgents.length}</small>
+            </div>
+            <div className="background-hud-list">
+              {backgroundAgents.map((agent) => {
+                const probe = agent.kind === 'shell' ? backgroundProbes[agent.detail] : null
+                const percent = typeof probe?.percent === 'number' ? probe.percent : null
+                // With no percentage the panel would otherwise show only a name and a clock,
+                // so fall back to the live evidence each kind of work actually has.
+                const note = percent === null
+                  ? activityLine(agent.kind === 'shell' ? probe?.line : agent.detail)
+                  : ''
+                return (
+                  <div className="background-item" key={agent.id}>
+                    <Ring percent={percent} />
+                    <div className="background-item-body">
+                      <strong title={agent.name}>{agent.name}</strong>
+                      <div className="background-item-meta" key={tick}>
+                        {percent === null ? (
+                          <span>Running for {elapsedLabel(agent.startedAt)}</span>
+                        ) : (
+                          <>
+                            <span className="background-percent">{percent}%</span>
+                            <span className="background-dot-sep">·</span>
+                            <span>{probe?.eta ? `${probe.eta} left` : elapsedLabel(agent.startedAt)}</span>
+                          </>
+                        )}
+                      </div>
+                      <div className="background-bar">
+                        <span
+                          className={percent === null ? 'indeterminate' : ''}
+                          style={percent === null ? undefined : { width: `${percent}%` }}
+                        />
+                      </div>
+                      {note && (
+                        <span className="background-intent" title={note}>{note}</span>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </aside>
+        )}
         <div
           className={`conversation ${draggingFiles ? 'dragging-files' : ''}`}
           ref={conversationRef}
@@ -3094,11 +3412,26 @@ function App() {
             )}
           </div>
         </div>
+        </div>
 
-        {selected && !atBottom && (
-          <button className="jump-latest" onClick={jumpToLatest}>
-            <ArrowDown size={13} /> Jump to latest
-          </button>
+        {selected && (userTurnCount > 0 || !atBottom) && (
+          <div className="conversation-jumps">
+            {userTurnCount > 0 && (
+              <button
+                className="jump-mine"
+                onClick={jumpToMyTurn}
+                title="Go to your last message (⌘J). Press again to step further back."
+              >
+                <CornerUpLeft size={13} />
+                {jumpLabel}
+              </button>
+            )}
+            {!atBottom && (
+              <button className="jump-latest" onClick={jumpToLatest}>
+                <ArrowDown size={13} /> Jump to latest
+              </button>
+            )}
+          </div>
         )}
 
         {selected && (
@@ -3262,6 +3595,15 @@ function App() {
                     <Square size={12} /> Stop
                   </button>
                 )}
+                {messages.length > 0 && (
+                  <button
+                    className="keep-working"
+                    onClick={keepWorking}
+                    title={working ? 'Queue "keep working"' : 'Send "keep working"'}
+                  >
+                    <RotateCw size={12} /> Keep working
+                  </button>
+                )}
                 <button
                   className={`send ${working ? 'queueing' : ''}`}
                   onClick={sendMessage}
@@ -3373,6 +3715,11 @@ function App() {
             <button type="button" role="menuitem" onClick={() => { setRowMenu(null); toggleSessionPin(rowMenu.session.id) }}>
               <Pin size={13} /> {pinnedSessionIds.includes(rowMenu.session.id) ? 'Unpin' : 'Pin'}
             </button>
+            {!isOwnedSession(rowMenu.session.id) && (
+              <button type="button" role="menuitem" onClick={() => { setRowMenu(null); adoptSession(rowMenu.session.id) }}>
+                <Eye size={13} /> Keep in my sessions
+              </button>
+            )}
             <button type="button" role="menuitem" onClick={() => { setRowMenu(null); forkSession(rowMenu.session) }}>
               <GitFork size={13} /> Fork this session
             </button>
@@ -3393,6 +3740,62 @@ function App() {
             <div className="permission-actions">
               <button onClick={() => setSessionToDelete(null)}>Cancel</button>
               <button className="danger" onClick={deleteSession}>Delete session</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {cleanupOpen && (
+        <div className="permission-backdrop">
+          <div className="permission-dialog cleanup-dialog">
+            <span className="permission-icon delete"><Trash2 size={18} /></span>
+            <h2>Clean up external sessions</h2>
+            <p>
+              These were started outside this app, usually by the Copilot CLI in a terminal.
+              Deleting removes them from disk for every Copilot surface.
+            </p>
+            <div className="cleanup-toolbar">
+              <button
+                type="button"
+                onClick={() => setCleanupSelected(
+                  cleanupSelected.length === cleanupCandidates.length
+                    ? []
+                    : cleanupCandidates.map((session) => session.id),
+                )}
+                disabled={!!cleanupBusy}
+              >
+                {cleanupSelected.length === cleanupCandidates.length ? 'Select none' : 'Select all'}
+              </button>
+              <small>{cleanupSelected.length} of {cleanupCandidates.length} selected</small>
+            </div>
+            <div className="cleanup-list">
+              {cleanupCandidates.map((session) => (
+                <label key={session.id} className="cleanup-row">
+                  <input
+                    type="checkbox"
+                    checked={cleanupSelected.includes(session.id)}
+                    disabled={!!cleanupBusy}
+                    onChange={(event) => setCleanupSelected((items) => (
+                      event.target.checked
+                        ? [...items, session.id]
+                        : items.filter((id) => id !== session.id)
+                    ))}
+                  />
+                  <span className="cleanup-title">{aliases[session.id] || session.title}</span>
+                  <small>{displayTime(session.updatedAt)}</small>
+                </label>
+              ))}
+            </div>
+            <div className="permission-actions">
+              <button onClick={() => setCleanupOpen(false)} disabled={!!cleanupBusy}>Cancel</button>
+              <button
+                className="danger"
+                onClick={runCleanup}
+                disabled={!cleanupSelected.length || !!cleanupBusy}
+              >
+                {cleanupBusy
+                  ? `Deleting ${cleanupBusy.done}/${cleanupBusy.total}`
+                  : `Delete ${cleanupSelected.length} session${cleanupSelected.length === 1 ? '' : 's'}`}
+              </button>
             </div>
           </div>
         </div>

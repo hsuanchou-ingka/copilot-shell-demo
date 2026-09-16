@@ -603,6 +603,47 @@ ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attac
   }
 })
 
+// The runtime keeps its own registry of background agents with a real status field, so ask it
+// rather than inferring liveness from the event log. Event history cannot tell a finished
+// agent from one whose completion notice was never written.
+//
+// Agents only. The registry also lists shell tasks, but those are already tracked from the
+// event log, where each one carries the shell id that the log probe needs to report progress.
+// Taking them from here as well would list every background command twice and strip the copy
+// that can show a percentage.
+ipcMain.handle('copilot:list-tasks', async (_event, sessionId) => {
+  try {
+    const session = await resumeSession(sessionId)
+    const list = await session.rpc.tasks.list()
+    const running = (list.tasks || []).filter((task) => task.type === 'agent' && task.status === 'running')
+    const tasks = await Promise.all(running.map(async (task) => {
+      let intent = ''
+      try {
+        // Agent progress reports no percentage, so the honest answer to "how is it going" is
+        // what it is doing right now. latestIntent is only set for some agent types, and
+        // recentActivity is always present, so its last line is the fallback.
+        const result = await session.rpc.tasks.getProgress({ taskId: task.id })
+        const progress = result?.progress || {}
+        const activity = progress.recentActivity || []
+        const latest = activity[activity.length - 1]
+        intent = progress.latestIntent || latest?.message || ''
+      } catch {
+        // Progress is best effort. A task can finish between the list and this call.
+      }
+      return {
+        id: task.id,
+        type: task.type,
+        name: task.displayName || task.description || 'Background agent',
+        intent,
+        startedAt: Date.parse(task.startedAt) || Date.now(),
+      }
+    }))
+    return { ok: true, tasks }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 // Slash commands come straight from the runtime, so the palette lists exactly what this
 // session can run: built-ins plus every discovered skill.
 ipcMain.handle('copilot:list-commands', async (_event, sessionId) => {
@@ -1017,6 +1058,11 @@ function createMenu() {
           label: 'Search Sessions',
           accelerator: 'CommandOrControl+K',
           click: () => sendToRenderer('app:command', 'focus-search'),
+        },
+        {
+          label: 'Go to My Last Message',
+          accelerator: 'CommandOrControl+J',
+          click: () => sendToRenderer('app:command', 'jump-to-my-turn'),
         },
         { type: 'separator' },
         { role: 'close' },
