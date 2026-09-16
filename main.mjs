@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, screen, shell }
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
@@ -54,6 +54,15 @@ const LOG_FILE = path.join(app.getPath('userData'), 'app.log')
 const LOG_MAX_BYTES = 1024 * 1024
 const ATTACHMENTS_DIRECTORY = path.join(app.getPath('userData'), 'attachments')
 const PASTED_IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp'])
+const IMAGE_MIME_TYPES = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+}
+const ATTACHMENT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+const PREVIEWS_DIRECTORY = path.join(app.getPath('temp'), 'hc-copilot-previews')
 const DEFAULT_BOUNDS = { width: 1360, height: 880 }
 const MIN_WINDOW_WIDTH = 940
 const MIN_WINDOW_HEIGHT = 650
@@ -363,6 +372,122 @@ ipcMain.handle('copilot:instruction-files', async (_event, workingDirectory) => 
   }
 })
 
+// Detached shells write three sibling files into the temp dir: a .log of their output,
+// a .pid, and a .exit that only appears once the command is over. The .exit file is the
+// only trustworthy "is it done" signal, so we check for it before parsing anything.
+const DETACHED_PREFIX = 'copilot-detached-'
+
+// tqdm renders "83%|####  | 25/30 [03:36<00:44,  5.9s/it]", which carries both the
+// percentage and the estimated time left. Progress bars repaint with carriage returns,
+// so the tail has to be split on \r as well as \n.
+const TQDM_RE = /(\d{1,3})%\|[^|]*\|\s*(\d+)\/(\d+)\s*\[([\d:]+)<([\d:]+)/
+// Rich (PyTorch Lightning) renders "Epoch 39/39 ---- 40/40 0:01:07 • 0:00:00", where the
+// value after the bullet is the time remaining.
+const RICH_RE = /(?:epoch|step)\s+(\d+)\/(\d+).*?\s(\d+:\d{2}(?::\d{2})?)\s*•\s*(\d+:\d{2}(?::\d{2})?)/i
+const FRACTION_RE = /(?:epoch|step|iter|iteration)\s*[:\s]?\s*(\d+)\s*\/\s*(\d+)/i
+const PERCENT_RE = /(\d{1,3}(?:\.\d+)?)\s*%/
+
+function parseProgress(tail) {
+  const lines = tail.split(/[\r\n]+/).map((line) => line.trim()).filter(Boolean)
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]
+
+    const tqdm = line.match(TQDM_RE)
+    if (tqdm) {
+      return { percent: Number(tqdm[1]), done: Number(tqdm[2]), total: Number(tqdm[3]), eta: tqdm[5], line }
+    }
+
+    const rich = line.match(RICH_RE)
+    if (rich) {
+      const done = Number(rich[1])
+      const total = Number(rich[2])
+      if (total > 0 && done <= total) {
+        return { percent: Math.round((done / total) * 100), done, total, eta: rich[4], line }
+      }
+    }
+
+    const fraction = line.match(FRACTION_RE)
+    if (fraction) {
+      const done = Number(fraction[1])
+      const total = Number(fraction[2])
+      if (total > 0 && done <= total) {
+        return { percent: Math.round((done / total) * 100), done, total, eta: '', line }
+      }
+    }
+
+    const percent = line.match(PERCENT_RE)
+    if (percent) {
+      const value = Number(percent[1])
+      if (value >= 0 && value <= 100) return { percent: Math.round(value), eta: '', line }
+    }
+  }
+  return { percent: null, eta: '', line: lines[lines.length - 1] || '' }
+}
+
+async function probeDetachedShell(shellId) {
+  const directory = app.getPath('temp')
+  let entries = []
+  try {
+    entries = await readdir(directory)
+  } catch {
+    return null
+  }
+
+  // Names look like copilot-detached-<shellId>-<epochMs>-<uuid>.log. Matching on the plain
+  // prefix would let "training" swallow "training-resume", so the timestamp anchors the id.
+  const escaped = shellId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const namePattern = new RegExp(`^${DETACHED_PREFIX}${escaped}-\\d{10,}-[^-]`)
+  const logs = entries.filter((name) => name.endsWith('.log') && namePattern.test(name))
+  // No log at all means the temp files were already cleaned up, so the command is long gone.
+  // Callers use this to clear ghosts left behind when a completion notice was never recorded.
+  if (!logs.length) return { shellId, missing: true, finished: true, percent: null, eta: '' }
+
+  let newest = null
+  for (const name of logs) {
+    const full = path.join(directory, name)
+    try {
+      const stats = statSync(full)
+      if (!newest || stats.mtimeMs > newest.mtimeMs) newest = { full, name, mtimeMs: stats.mtimeMs }
+    } catch { /* the file may vanish between listing and stat */ }
+  }
+  if (!newest) return null
+
+  const finished = existsSync(newest.full.replace(/\.log$/, '.exit'))
+
+  let tail = ''
+  try {
+    const handle = await open(newest.full, 'r')
+    try {
+      const { size } = await handle.stat()
+      const length = Math.min(size, 16 * 1024)
+      const buffer = Buffer.alloc(length)
+      await handle.read(buffer, 0, length, size - length)
+      tail = buffer.toString('utf8')
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return { shellId, finished, percent: null, eta: '', line: '' }
+  }
+
+  const progress = parseProgress(tail)
+  return { shellId, finished, updatedAt: newest.mtimeMs, ...progress }
+}
+
+ipcMain.handle('copilot:probe-background', async (_event, shellIds) => {
+  try {
+    const list = Array.isArray(shellIds) ? shellIds.filter(Boolean).slice(0, 24) : []
+    const probes = await Promise.all(list.map((id) => probeDetachedShell(id).catch(() => null)))
+    const report = {}
+    probes.forEach((probe, index) => {
+      if (probe) report[list[index]] = probe
+    })
+    return { ok: true, report }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 ipcMain.handle('copilot:refresh-quota', async () => {
   try {
     const copilot = await getClient()
@@ -416,6 +541,35 @@ ipcMain.handle('copilot:create-session', async (_event, options = {}) => {
   }
 })
 
+ipcMain.handle('copilot:fork-session', async (_event, { sessionId, name }) => {
+  try {
+    const copilot = await getClient()
+    const sessions = await copilot.listSessions()
+    const source = sessions.find((item) => item.sessionId === sessionId)
+    if (!source) return { ok: false, error: { message: 'The source session could not be found.' } }
+
+    const forkName = typeof name === 'string' && name.trim()
+      ? name.trim()
+      : `${source.summary || 'Untitled session'} copy`
+    const fork = await copilot.rpc.sessions.fork({ sessionId, name: forkName })
+    const now = new Date().toISOString()
+
+    return {
+      ok: true,
+      session: {
+        id: fork.sessionId,
+        title: fork.name || forkName,
+        createdAt: now,
+        updatedAt: now,
+        context: toSessionContext(source.context),
+        remote: false,
+      },
+    }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 ipcMain.handle('copilot:open-session', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
@@ -449,8 +603,70 @@ ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attac
   }
 })
 
-ipcMain.handle('copilot:abort-session', async (_event, sessionId) => {
+// Slash commands come straight from the runtime, so the palette lists exactly what this
+// session can run: built-ins plus every discovered skill.
+ipcMain.handle('copilot:list-commands', async (_event, sessionId) => {
   try {
+    const session = await resumeSession(sessionId)
+    const list = await session.rpc.commands.list({
+      includeBuiltins: true,
+      includeSkills: true,
+      includeClientCommands: true,
+    })
+    return {
+      ok: true,
+      commands: (list.commands || []).map((command) => ({
+        name: command.name,
+        kind: command.kind,
+        description: command.description || '',
+        aliases: command.aliases || [],
+        hint: command.input?.hint || '',
+        requiresInput: Boolean(command.input?.required),
+        allowDuringAgentExecution: Boolean(command.allowDuringAgentExecution),
+      })),
+    }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+// Invoking returns one of several shapes. Only two matter to this UI: text to print, or a
+// prompt to hand to the agent. Everything else is reported as handled with no output.
+ipcMain.handle('copilot:invoke-command', async (_event, { sessionId, name, input }) => {
+  try {
+    const session = await resumeSession(sessionId)
+    const result = await session.rpc.commands.invoke({ name, input: input || '' })
+    if (result?.kind === 'text') {
+      return { ok: true, outcome: 'text', text: result.text || '' }
+    }
+    if (result?.kind === 'agent-prompt') {
+      const messageId = await session.send({ prompt: result.prompt })
+      return {
+        ok: true,
+        outcome: 'prompt',
+        messageId,
+        displayPrompt: result.displayPrompt || '',
+        notice: result.notice || '',
+      }
+    }
+    if (result?.kind === 'set-model') {
+      return { ok: true, outcome: 'text', text: `Model set to ${result.model}.` }
+    }
+    if (result?.kind === 'select-subcommand') {
+      const options = (result.options || []).map((option) => `/${result.command} ${option.name || option}`)
+      return {
+        ok: true,
+        outcome: 'text',
+        text: `${result.title || 'Pick one'}\n\n${options.join('\n')}`,
+      }
+    }
+    return { ok: true, outcome: 'done' }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('copilot:abort-session', async (_event, sessionId) => {  try {
     const active = activeSessions.get(sessionId)
     if (!active) return { ok: false, error: { message: 'Session is not running.' } }
     await active.session.abort()
@@ -508,8 +724,26 @@ ipcMain.handle('copilot:save-pasted-image', async (_event, payload = {}) => {
   }
 })
 
-ipcMain.handle('copilot:set-model', async (_event, { sessionId, model }) => {
+ipcMain.handle('copilot:read-attachment-preview', async (_event, filePath) => {
   try {
+    if (typeof filePath !== 'string' || !filePath) {
+      return { ok: false, error: { message: 'No attachment path was provided.' } }
+    }
+    const extension = path.extname(filePath).slice(1).toLowerCase()
+    const mimeType = IMAGE_MIME_TYPES[extension]
+    if (!mimeType) return { ok: false, error: { message: 'That attachment is not a previewable image.' } }
+    const stats = statSync(filePath)
+    if (stats.size > ATTACHMENT_PREVIEW_MAX_BYTES) {
+      return { ok: false, error: { message: 'That image is too large to preview.' } }
+    }
+    const buffer = await readFile(filePath)
+    return { ok: true, dataUrl: `data:${mimeType};base64,${buffer.toString('base64')}` }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('copilot:set-model', async (_event, { sessionId, model }) => {  try {
     const session = await resumeSession(sessionId)
     await session.setModel(model)
     return { ok: true }
@@ -544,6 +778,61 @@ ipcMain.handle('app:open-external', async (_event, url) => {
     return { ok: true }
   } catch {
     return { ok: false }
+  }
+})
+
+ipcMain.handle('preview:open-in-browser', async (_event, html) => {
+  try {
+    if (typeof html !== 'string' || !html.trim()) {
+      return { ok: false, error: { message: 'There is nothing to preview.' } }
+    }
+    await mkdir(PREVIEWS_DIRECTORY, { recursive: true })
+    const filePath = path.join(PREVIEWS_DIRECTORY, `preview-${randomUUID()}.html`)
+    await writeFile(filePath, html, 'utf8')
+    const error = await shell.openPath(filePath)
+    if (error) return { ok: false, error: { message: error } }
+    return { ok: true, path: filePath }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('preview:save-html', async (_event, { html, suggestedName } = {}) => {
+  try {
+    if (typeof html !== 'string' || !html.trim()) {
+      return { ok: false, error: { message: 'There is nothing to save.' } }
+    }
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save preview',
+      defaultPath: suggestedName || 'preview.html',
+      filters: [{ name: 'HTML', extensions: ['html'] }],
+    })
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true }
+    await writeFile(result.filePath, html, 'utf8')
+    return { ok: true, path: result.filePath }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('app:open-path', async (_event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) return { ok: false }
+    const error = await shell.openPath(targetPath)
+    if (error) return { ok: false, error: { message: error } }
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('app:reveal-path', async (_event, targetPath) => {
+  try {
+    if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) return { ok: false }
+    shell.showItemInFolder(targetPath)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
   }
 })
 

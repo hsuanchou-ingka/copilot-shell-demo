@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('copilot', {
   forkSession: (options) => ipcRenderer.invoke('copilot:fork-session', options),
   openSession: (sessionId) => ipcRenderer.invoke('copilot:open-session', sessionId),
   sendMessage: (options) => ipcRenderer.invoke('copilot:send-message', options),
+  listCommands: (sessionId) => ipcRenderer.invoke('copilot:list-commands', sessionId),
+  invokeCommand: (options) => ipcRenderer.invoke('copilot:invoke-command', options),
   abortSession: (sessionId) => ipcRenderer.invoke('copilot:abort-session', sessionId),
   pickAttachments: () => ipcRenderer.invoke('copilot:pick-attachments'),
   savePastedImage: (data, extension) => ipcRenderer.invoke('copilot:save-pasted-image', { data, extension }),

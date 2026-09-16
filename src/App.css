@@ -140,9 +140,10 @@ button {
 /* Reserves room for the macOS traffic lights and gives the window something to drag. */
 .titlebar {
   height: 46px;
-  padding-left: 72px;
+  padding: 0 4px 0 72px;
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   overflow: hidden;
   -webkit-app-region: drag;
 }
@@ -1429,32 +1430,54 @@ button {
   font-weight: 700;
 }
 
-.background-rail {
-  padding: 8px 12px 10px;
-  border-bottom: 1px solid var(--line);
-  flex-shrink: 0;
+/* Pinned to the top right of the chat, so background work stays visible without stealing
+   room from the conversation. It floats above the thread rather than pushing it down. */
+.background-hud {
+  position: absolute;
+  top: 74px;
+  right: 16px;
+  z-index: 6;
+  width: 262px;
+  padding: 9px 11px 11px;
+  border: 1px solid #e1dfda;
+  border-radius: 12px;
+  background: rgba(253, 252, 250, .96);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 10px 28px rgba(48, 47, 43, .11);
 }
 
-.background-rail-title {
-  display: inline-flex;
+.background-hud-head {
+  display: flex;
   align-items: center;
   gap: 6px;
+  color: #6f6c66;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+
+.background-hud-head small {
+  margin-left: auto;
+  color: #8d8a83;
+  font-size: 10px;
+  font-weight: 600;
 }
 
 .background-pulse {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--accent);
+  background: #b8926a;
   animation: dot-blink 1.4s ease-in-out infinite;
 }
 
-.background-rail-list {
+.background-hud-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin-top: 6px;
-  max-height: 168px;
+  margin-top: 7px;
+  max-height: 232px;
   overflow-y: auto;
 }
 
@@ -1481,13 +1504,13 @@ button {
 
 .background-ring .ring-track {
   fill: none;
-  stroke: var(--line);
+  stroke: #e5e2dc;
   stroke-width: 2.5;
 }
 
 .background-ring .ring-value {
   fill: none;
-  stroke: var(--accent);
+  stroke: #b8926a;
   stroke-width: 2.5;
   stroke-linecap: round;
   transition: stroke-dashoffset 0.4s ease;
@@ -1518,7 +1541,7 @@ button {
 }
 
 .background-percent {
-  color: var(--accent);
+  color: #b8926a;
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
@@ -1530,7 +1553,7 @@ button {
 .background-bar {
   height: 3px;
   border-radius: 2px;
-  background: var(--line);
+  background: #e5e2dc;
   overflow: hidden;
   margin-top: 5px;
 }
@@ -1539,7 +1562,7 @@ button {
   display: block;
   height: 100%;
   border-radius: 2px;
-  background: var(--accent);
+  background: #b8926a;
   transition: width 0.4s ease;
 }
 
@@ -1570,7 +1593,7 @@ button {
   position: relative;
   width: min(var(--content-width), 100% - 48px);
   margin: 0 auto;
-  padding: 44px 0 145px;
+  padding: 44px 0 calc(var(--composer-height, 105px) + 40px);
 }
 
 .conversation.dragging-files {
@@ -2224,8 +2247,7 @@ button {
   width: min(var(--content-width), 100% - 48px);
   margin: 0 auto;
   padding: 10px 14px;
-  border: 1px solid #cecbc4;
-  border-radius: 13px;
+  border: 1px solid #cecbc4;  border-radius: 13px;
   background: #fff;
   box-shadow: 0 9px 28px rgba(50, 46, 39, .08);
 }
@@ -3043,8 +3065,10 @@ button {
 }
 
 .artifact-stage {
+  height: 100%;
   min-height: 100%;
   display: flex;
+  align-items: flex-start;
   justify-content: center;
   background: #e9e7e2;
 }
@@ -3067,4 +3091,106 @@ button {
   line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Command palette: floats above the composer, anchored to the same content column. */
+.command-palette {
+  width: min(var(--content-width), 100% - 48px);
+  margin: 0 auto 8px;
+  border: 1px solid #e1dfda;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 18px 44px rgba(40, 34, 26, 0.16);
+  overflow: hidden;
+}
+
+.command-palette-head,
+.command-palette-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 14px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #8c877e;
+  background: #fbfaf8;
+}
+
+.command-palette-head { border-bottom: 1px solid #efede8; }
+.command-palette-foot {
+  justify-content: flex-start;
+  gap: 6px;
+  border-top: 1px solid #efede8;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.command-palette-foot kbd {
+  padding: 1px 5px;
+  border: 1px solid #e1dfda;
+  border-radius: 4px;
+  background: #fff;
+  font: inherit;
+  font-size: 10px;
+  color: #6f6a62;
+}
+
+.command-palette-list {
+  max-height: 264px;
+  overflow-y: auto;
+}
+
+.command-row {
+  display: grid;
+  grid-template-columns: 42px minmax(120px, auto) 1fr;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 14px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.command-row.active { background: #f4f0e9; }
+
+.command-kind {
+  padding: 2px 0;
+  border-radius: 4px;
+  background: #efede8;
+  color: #7a756c;
+  font-size: 10px;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.command-kind.skill { background: #f0e5d4; color: #8a6a3d; }
+.command-kind.builtin { background: #e9ecef; color: #6a7078; }
+
+.command-name {
+  color: #241f19;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.command-name em {
+  margin-left: 6px;
+  color: #b8926a;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 400;
+}
+
+.command-desc {
+  color: #7d786f;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

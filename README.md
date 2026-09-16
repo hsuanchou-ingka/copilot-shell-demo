@@ -4,6 +4,8 @@ A desktop client for GitHub Copilot CLI, built for people who run more than one 
 
 Copilot CLI is excellent, but it gives you one conversation in one terminal tab. When you are researching in one thread, refactoring in another, and waiting on a long build in a third, tabs stop being a good way to hold that. This app keeps every session in one window, shows you which ones are working and which ones are waiting on you, and lets you move between them without losing your place.
 
+![Sessions grouped by project, with the conversation open beside them](docs/screenshots/overview.png)
+
 ## Why it exists
 
 I am a designer, not a backend engineer. I use Copilot CLI daily for design tooling, prototypes, and document work, and I kept hitting the same three problems:
@@ -37,6 +39,28 @@ So I built the interface I wanted. Everything here exists because it solved one 
 **Keep an eye on long jobs.** Commands you leave running in the background appear in their own list with a progress ring and an estimated finish time, read from the output of tools that report progress.
 
 **Watch your quota.** Premium request usage is shown in the footer, so you know where you stand before starting something expensive.
+
+## A closer look
+
+**Type ahead while a turn is running.** Queued messages sit above the composer in the order you wrote them, and each one can be dropped before it sends.
+
+![Two messages queued while the current turn is still running](docs/screenshots/queue.png)
+
+**The resource rail.** One entry per kind, so it stays a way back to the thing rather than a list of everything mentioned.
+
+![The rail expanded to show a folder, a pull request, a Notion page, a Figma file and a local file](docs/screenshots/resources.png)
+
+**Artifact previews.** Generated markup renders beside the conversation at desktop, tablet or phone width.
+
+![An HTML swatch sheet rendering in the preview panel](docs/screenshots/artifact.png)
+
+**Background jobs.** Detached commands report progress and an estimated finish time without taking over the conversation.
+
+![Two background commands, one at 62 percent and one still starting](docs/screenshots/background.png)
+
+**Permission requests.** The exact command, in full, with a choice that lasts one call or the whole session.
+
+![A permission dialog showing the command Copilot wants to run](docs/screenshots/permission.png)
 
 ## Requirements
 

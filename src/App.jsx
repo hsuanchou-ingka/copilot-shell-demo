@@ -381,18 +381,37 @@ function collectResources(messages, workingDirectory) {
   return list
 }
 
-const SHELL_STARTED_RE = /<command started in (?:detached )?background with shellId: ([^>]+)>/g
+const SHELL_STARTED_RE = /<command started in (detached )?background with shellId: ([^>]+)>/g
 const SHELL_RUNNING_RE = /<command with shellId: (.+?) is still running/g
 const SHELL_DONE_RE = /<shellId: (.+?) completed with exit code/g
 const NOTIFY_DONE_RE = /\(shellId: ([^)]+)\)\s+has completed/g
 
-function matchAll(text, regex) {
+// Transcripts sometimes quote these markers verbatim, for example when the assistant prints
+// its own regex source. A real shellId is a plain slug, so anything else is quoted noise.
+const SHELL_ID_RE = /^[\w.:-]{1,80}$/
+
+function matchAll(text, regex, group = 1) {
   const found = []
   regex.lastIndex = 0
   let match = regex.exec(text)
   while (match) {
-    found.push(match[1].trim())
+    const value = (match[group] || '').trim()
+    if (SHELL_ID_RE.test(value)) found.push(value)
     match = regex.exec(text)
+  }
+  return found
+}
+
+// Same scan as matchAll but keeps the "detached " capture, because only detached shells
+// write the temp log files that the progress probe reads.
+function matchStartedShells(text) {
+  const found = []
+  SHELL_STARTED_RE.lastIndex = 0
+  let match = SHELL_STARTED_RE.exec(text)
+  while (match) {
+    const id = (match[2] || '').trim()
+    if (SHELL_ID_RE.test(id)) found.push({ id, detached: Boolean(match[1]) })
+    match = SHELL_STARTED_RE.exec(text)
   }
   return found
 }
@@ -439,23 +458,37 @@ function foldBackgroundActivity(state, event) {
     const text = resultText(data)
     let agents = state.backgroundAgents
 
+    // Additions run before removals. One result can carry both "started" and "completed" for
+    // the same shell, and the command is over by the time we read it, so removal must win.
+    const running = [
+      ...matchStartedShells(text),
+      ...matchAll(text, SHELL_RUNNING_RE).map((id) => ({ id, detached: false })),
+    ]
+    for (const shell of running) {
+      const id = `shell:${shell.id}`
+      const existing = agents.find((item) => item.id === id)
+      if (existing) {
+        // A later "still running" notice must not downgrade a shell we know is detached.
+        if (shell.detached && !existing.detached) {
+          agents = agents.map((item) => (item.id === id ? { ...item, detached: true } : item))
+        }
+        continue
+      }
+      agents = [...agents, {
+        id,
+        kind: 'shell',
+        detached: shell.detached,
+        name: pending?.label || `Shell ${shell.id}`,
+        detail: shell.id,
+        startedAt: pending?.startedAt || eventTime(event),
+      }]
+    }
+
     if (pending?.toolName === 'stop_bash' && pending.shellId) {
       agents = agents.filter((item) => item.id !== `shell:${pending.shellId}`)
     }
     for (const shellId of matchAll(text, SHELL_DONE_RE)) {
       agents = agents.filter((item) => item.id !== `shell:${shellId}`)
-    }
-    const running = [...matchAll(text, SHELL_STARTED_RE), ...matchAll(text, SHELL_RUNNING_RE)]
-    for (const shellId of running) {
-      const id = `shell:${shellId}`
-      if (agents.some((item) => item.id === id)) continue
-      agents = [...agents, {
-        id,
-        kind: 'shell',
-        name: pending?.label || `Shell ${shellId}`,
-        detail: shellId,
-        startedAt: pending?.startedAt || eventTime(event),
-      }]
     }
     return { ...state, pendingTools: rest, backgroundAgents: agents }
   }
@@ -495,6 +528,10 @@ function foldBackgroundActivity(state, event) {
 // records its completion notices. Only trust a replay when the log was active recently.
 const REPLAY_FRESHNESS_MS = 30 * 60 * 1000
 
+// Ceiling for a non-detached background shell. Those report completion through the event log,
+// so once one runs this long without a notice the record is almost certainly lost.
+const UNTRACKED_SHELL_MAX_MS = 20 * 60 * 1000
+
 function backgroundActivityFromEvents(events) {
   let state = { pendingTools: {}, backgroundAgents: [] }
   for (const event of events || []) state = foldBackgroundActivity(state, event)
@@ -503,6 +540,47 @@ function backgroundActivityFromEvents(events) {
     return { pendingTools: {}, backgroundAgents: [] }
   }
   return state
+}
+
+// The palette only opens on a slash that starts the message, and it closes as soon as the
+// command name is finished, so typing a path like /Users/me inside a sentence stays quiet.
+function slashQueryAt(text, caret) {
+  if (!text.startsWith('/')) return null
+  const head = text.slice(0, Math.max(0, caret))
+  if (!head.startsWith('/') || /\s/.test(head)) return null
+  return head.slice(1)
+}
+
+// Ranks by where the match lands: name prefix beats alias prefix beats a hit anywhere in the
+// name, and a description-only hit ranks last so exact command names always float up.
+function rankCommands(commands, query) {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return commands.slice(0, 60)
+  const scored = []
+  for (const command of commands) {
+    const name = command.name.toLowerCase()
+    const aliases = (command.aliases || []).map((alias) => alias.toLowerCase())
+    let score = -1
+    if (name === needle) score = 0
+    else if (name.startsWith(needle)) score = 1
+    else if (aliases.some((alias) => alias === needle || alias.startsWith(needle))) score = 2
+    else if (name.includes(needle)) score = 3
+    else if ((command.description || '').toLowerCase().includes(needle)) score = 4
+    if (score >= 0) scored.push({ command, score })
+  }
+  scored.sort((a, b) => (a.score - b.score) || a.command.name.localeCompare(b.command.name))
+  return scored.slice(0, 60).map((entry) => entry.command)
+}
+
+// Splits "/plan tidy the readme" into the command name and everything the command should
+// receive as its input.
+function parseSlashInput(text) {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('/')) return null
+  const body = trimmed.slice(1)
+  const space = body.search(/\s/)
+  if (space < 0) return { name: body, input: '' }
+  return { name: body.slice(0, space), input: body.slice(space + 1).trim() }
 }
 
 // A donut that fills clockwise. With no percentage to show it spins slowly instead, so the
@@ -572,8 +650,18 @@ function modelLabel(model) {
   return `${model.name} (${cost} · ${speed})`
 }
 
+// Invoking a skill expands into a long preamble plus the whole skill file. Showing that raw
+// in the transcript is noise, so collapse it back to the command the user actually typed.
+const SKILL_PREAMBLE_RE = /^The user explicitly invoked the "(\/[\w.-]+)" skill\. Follow its instructions now\./
+
+function collapseCommandPrompt(content) {
+  if (typeof content !== 'string') return content
+  const match = SKILL_PREAMBLE_RE.exec(content)
+  return match ? match[1] : content
+}
+
 function eventContent(event) {
-  return event?.data?.content || event?.data?.prompt || event?.data?.message || ''
+  return collapseCommandPrompt(event?.data?.content || event?.data?.prompt || event?.data?.message || '')
 }
 
 function eventAttachments(event) {
@@ -620,11 +708,21 @@ function mergeMessage(items, incoming) {
   if (index < 0 && incoming.role === 'user') {
     index = items.findIndex((item) => item.optimistic && item.role === 'user' && item.content === incoming.content)
   }
+  // A collapsed slash command lost its arguments, so pair it with the line the user typed.
+  let keepContent = false
+  if (index < 0 && incoming.role === 'user' && /^\/[\w.-]+$/.test(incoming.content)) {
+    index = items.findIndex((item) => (
+      item.commandEcho && item.role === 'user' && parseSlashInput(item.content)?.name === incoming.content.slice(1)
+    ))
+    keepContent = index >= 0
+  }
   if (index >= 0) {
     const previous = items[index]
     const next = items.slice()
     next[index] = {
       ...incoming,
+      content: keepContent ? previous.content : incoming.content,
+      commandEcho: previous.commandEcho,
       attachments: incoming.attachments?.length ? incoming.attachments : previous.attachments,
     }
     return next
@@ -738,21 +836,21 @@ const PREVIEW_RESET = `
 function buildPreviewDocument(kind, code) {
   const body = String(code || '')
   if (kind === 'svg') {
-    return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_RESET}
+    return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_BRIDGE}${PREVIEW_RESET}
 <style>body{min-height:100vh;display:grid;place-items:center;padding:24px;background:#fff}svg{max-width:100%;height:auto}</style>
-</head><body>${body}${PREVIEW_BRIDGE}</body></html>`
+</head><body>${body}</body></html>`
   }
   if (kind === 'css') {
-    return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_RESET}<style>${body}</style>
+    return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_BRIDGE}${PREVIEW_RESET}<style>${body}</style>
 </head><body><div class="preview-css-note" style="padding:24px;font:13px/1.6 -apple-system,sans-serif;color:#6b6862">
-These styles are loaded. Add markup that uses them to see the result.</div>${PREVIEW_BRIDGE}</body></html>`
+These styles are loaded. Add markup that uses them to see the result.</div></body></html>`
   }
   if (/<html[\s>]/i.test(body)) {
-    if (/<\/body>/i.test(body)) return body.replace(/<\/body>/i, `${PREVIEW_BRIDGE}</body>`)
-    return `${body}${PREVIEW_BRIDGE}`
+    if (/<head[^>]*>/i.test(body)) return body.replace(/<head[^>]*>/i, (match) => `${match}${PREVIEW_BRIDGE}`)
+    return body.replace(/<html[^>]*>/i, (match) => `${match}<head>${PREVIEW_BRIDGE}</head>`)
   }
-  return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_RESET}
-</head><body>${body}${PREVIEW_BRIDGE}</body></html>`
+  return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_BRIDGE}${PREVIEW_RESET}
+</head><body>${body}</body></html>`
 }
 
 function previewTitleOf(kind, code) {
@@ -916,6 +1014,7 @@ function ArtifactPanel({ artifact, onClose, onError }) {
   const [device, setDevice] = useState('desktop')
   const [runtimeError, setRuntimeError] = useState('')
   const [reloadKey, setReloadKey] = useState(0)
+  const [frameHeight, setFrameHeight] = useState(0)
   const [copied, setCopied] = useState(false)
   const frameRef = useRef(null)
 
@@ -926,6 +1025,7 @@ function ArtifactPanel({ artifact, onClose, onError }) {
 
   useEffect(() => {
     setRuntimeError('')
+    setFrameHeight(0)
     setTab('preview')
   }, [artifact.id])
 
@@ -935,6 +1035,12 @@ function ArtifactPanel({ artifact, onClose, onError }) {
       if (event.source !== frameRef.current?.contentWindow) return
       if (event.data.type === 'error') setRuntimeError(String(event.data.message || 'Script error'))
       if (event.data.type === 'navigate') window.copilot?.openExternal(event.data.href)
+      // A preview taller than the panel has to grow the frame, otherwise the iframe keeps its
+      // own scrollbar and the bottom of the document is simply lost.
+      if (event.data.type === 'size') {
+        const height = Number(event.data.height)
+        if (Number.isFinite(height) && height > 0) setFrameHeight(Math.ceil(height))
+      }
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
@@ -942,6 +1048,7 @@ function ArtifactPanel({ artifact, onClose, onError }) {
 
   const reload = () => {
     setRuntimeError('')
+    setFrameHeight(0)
     setReloadKey((value) => value + 1)
   }
 
@@ -1055,7 +1162,10 @@ function ArtifactPanel({ artifact, onClose, onError }) {
               title="UI preview"
               sandbox="allow-scripts allow-forms allow-modals"
               srcDoc={document_}
-              style={deviceWidth ? { width: `${deviceWidth}px` } : undefined}
+              style={{
+                ...(deviceWidth ? { width: `${deviceWidth}px` } : null),
+                ...(frameHeight ? { height: `${frameHeight}px` } : null),
+              }}
             />
           </div>
         ) : (
@@ -1077,7 +1187,10 @@ function App() {
   const [messages, setMessages] = useState([])
   const [sessionState, setSessionState] = useState({})
   const [backgroundProbes, setBackgroundProbes] = useState({})
-  const [tick, setTick] = useState(0)
+  const [commands, setCommands] = useState([])
+  const [paletteQuery, setPaletteQuery] = useState(null)
+  const [paletteIndex, setPaletteIndex] = useState(0)
+  const [tick, setTick] = useState(() => Date.now())
   const [quota, setQuota] = useState(null)
   const [capabilities, setCapabilities] = useState(null)
   const [knowledge, setKnowledge] = useState([])
@@ -1087,6 +1200,7 @@ function App() {
   const composingRef = useRef(false)
   const compositionEndedAtRef = useRef(0)
   const composerRef = useRef(null)
+  const activeRowRef = useRef(null)
   const [attachments, setAttachments] = useState([])
   const [draggingFiles, setDraggingFiles] = useState(false)
   const [error, setError] = useState(null)
@@ -1126,6 +1240,7 @@ function App() {
   const atBottomRef = useRef(true)
   const searchInputRef = useRef(null)
   const conversationRef = useRef(null)
+  const composerWrapRef = useRef(null)
   const dragDepthRef = useRef(0)
   const dragStateRef = useRef(null)
   const restoredSelectionRef = useRef(false)
@@ -1282,13 +1397,41 @@ function App() {
   const quotaSnapshot = quota?.premium_interactions || quota?.chat || null
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
-  const backgroundAgents = liveState.backgroundAgents
+  // A plain background shell that gets killed never reports a completion, so it would hang
+  // around forever. Detached shells are exempt: their log files tell us the real status.
+  const backgroundAgents = liveState.backgroundAgents.filter((item) => (
+    item.kind !== 'shell' || item.detached || tick - item.startedAt < UNTRACKED_SHELL_MAX_MS
+  ))
   const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
+
+  // The runtime owns the command list, so ask it once per session rather than guessing from
+  // the skill folders. Built-ins and skills arrive together with their descriptions.
+  useEffect(() => {
+    if (!api?.listCommands || !selectedId) return undefined
+    let cancelled = false
+    api.listCommands(selectedId).then((result) => {
+      if (cancelled || !result?.ok) return
+      setCommands(result.commands || [])
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [api, selectedId])
+
+  const paletteMatches = useMemo(
+    () => (paletteQuery === null ? [] : rankCommands(commands, paletteQuery)),
+    [commands, paletteQuery],
+  )
+  const paletteOpen = paletteQuery !== null && paletteMatches.length > 0
+  const activeMatch = paletteOpen ? paletteMatches[Math.min(paletteIndex, paletteMatches.length - 1)] : null
+
+  // Keep the arrow-key selection inside the scroll box.
+  useEffect(() => {
+    if (paletteOpen) activeRowRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [paletteIndex, paletteOpen])
 
   // Only tick while background work exists, so an idle app does no per-second work.
   useEffect(() => {
     if (!backgroundAgents.length) return undefined
-    const timer = setInterval(() => setTick((value) => value + 1), 1000)
+    const timer = setInterval(() => setTick(Date.now()), 1000)
     return () => clearInterval(timer)
   }, [backgroundAgents.length])
 
@@ -1329,9 +1472,12 @@ function App() {
     setError({ message: text, persistent: options.persistent || isAuthErrorMessage(text) })
   }, [])
 
-  // Poll the detached shell logs for progress while background work is live. The shellIds
-  // are the join key, so only shell items are probed; subagents have no log to read.
-  const shellIds = backgroundAgents.filter((item) => item.kind === 'shell').map((item) => item.detail).join(',')
+  // Poll the detached shell logs for progress while background work is live. Only detached
+  // shells write those logs, so probing anything else would read a missing file and look dead.
+  const shellIds = backgroundAgents
+    .filter((item) => item.kind === 'shell' && item.detached)
+    .map((item) => item.detail)
+    .join(',')
   useEffect(() => {
     if (!api?.probeBackground || !shellIds) return undefined
     let cancelled = false
@@ -1340,7 +1486,7 @@ function App() {
         if (cancelled || !result?.ok) return
         setBackgroundProbes(result.report)
         // The .exit file is ground truth: if it exists the command is over, even when the
-        // completion notice never made it into the event log.
+        // completion notice never made it into the event log. A vanished log means the same.
         const finished = Object.values(result.report).filter((probe) => probe.finished).map((probe) => probe.shellId)
         if (finished.length && selectedId) {
           patchSessionState(selectedId, (current) => ({
@@ -1729,6 +1875,24 @@ function App() {
     }).catch((e) => showError(e?.message || String(e)))
   }, [api, selectedProject, selectedWorkingDirectory])
 
+  // The composer is absolutely positioned so the conversation can fade out behind it, which
+  // means the scroll area has to reserve matching space. That space is not fixed: the queue
+  // strip, attachment chips and a grown textarea all make the composer taller.
+  useEffect(() => {
+    const composer = composerWrapRef.current
+    const conversation = conversationRef.current
+    if (!composer || !conversation) return undefined
+    const apply = () => {
+      const stuckToBottom = atBottomRef.current
+      conversation.style.setProperty('--composer-height', `${composer.offsetHeight}px`)
+      if (stuckToBottom) conversation.scrollTop = conversation.scrollHeight
+    }
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(composer)
+    return () => observer.disconnect()
+  }, [selectedId])
+
   useEffect(() => {
     if (!atBottomRef.current) return
     const node = conversationRef.current
@@ -2019,6 +2183,67 @@ function App() {
     deliverMessage(selectedId, prompt, [])
   }, [deliverMessage, selectedId, sessionState, writeQueue])
 
+  // Completing a command keeps whatever the user already typed after the name, so editing
+  // "/pla fix the docs" into "/plan fix the docs" does not lose the argument.
+  const applyCommand = useCallback((command) => {
+    if (!command) return
+    setMessage((current) => {
+      const rest = current.replace(/^\/\S*/, '')
+      return `/${command.name}${rest || ' '}`
+    })
+    setPaletteQuery(null)
+    setPaletteIndex(0)
+    composerRef.current?.focus()
+  }, [])
+
+  const findCommand = useCallback((name) => {
+    const needle = name.toLowerCase()
+    return commands.find((command) => (
+      command.name.toLowerCase() === needle ||
+      (command.aliases || []).some((alias) => alias.toLowerCase() === needle)
+    )) || null
+  }, [commands])
+
+  // Slash commands are not prompts. The runtime resolves them and either hands back text to
+  // print or a prompt it wants the agent to run, so they never reach the model verbatim.
+  const runSlashCommand = useCallback(async (sessionId, raw) => {
+    const parsed = parseSlashInput(raw)
+    if (!parsed) return false
+    const known = findCommand(parsed.name)
+    if (!known) return false
+
+    setMessages((items) => [...items, {
+      id: `local-${crypto.randomUUID()}`,
+      role: 'user',
+      content: raw,
+      attachments: [],
+      status: 'sent',
+      commandEcho: true,
+    }])
+    patchSessionState(sessionId, { working: true })
+
+    const result = await api.invokeCommand({ sessionId, name: known.name, input: parsed.input })
+    if (!result?.ok) {
+      patchSessionState(sessionId, { working: false })
+      showError(result?.error?.message || `Could not run /${known.name}.`)
+      return true
+    }
+    // A prompt result already started an agent turn, so the normal event stream takes over.
+    if (result.outcome === 'prompt') return true
+
+    patchSessionState(sessionId, { working: false })
+    if (result.outcome === 'text' && result.text) {
+      setMessages((items) => [...items, {
+        id: `local-${crypto.randomUUID()}`,
+        role: 'assistant',
+        content: result.text,
+        attachments: [],
+        status: 'sent',
+      }])
+    }
+    return true
+  }, [api, findCommand, patchSessionState, showError])
+
   const sendMessage = () => {
     const typedPrompt = message.trim()
     if ((!typedPrompt && !attachments.length) || !selectedId) return
@@ -2030,6 +2255,24 @@ function App() {
       displayName: item.displayName,
       thumbnail: item.thumbnail,
     }))
+    setPaletteQuery(null)
+
+    // Attachments only make sense on a real prompt, so a command carrying files falls through.
+    const parsed = sentAttachments.length ? null : parseSlashInput(typedPrompt)
+    const command = parsed ? findCommand(parsed.name) : null
+    if (command) {
+      // Queueing a command would re-send it as plain text later, which the model would only
+      // read rather than run. Some built-ins are safe mid-turn, the rest have to wait.
+      if (working && !command.allowDuringAgentExecution) {
+        showError(`/${command.name} cannot run while this chat is busy. Stop it or wait.`)
+        return
+      }
+      clearDraft(sessionId)
+      setError(null)
+      runSlashCommand(sessionId, typedPrompt)
+      return
+    }
+
     clearDraft(sessionId)
     setError(null)
     if (working) {
@@ -2372,49 +2615,6 @@ function App() {
           </div>
         )}
 
-        {backgroundAgents.length > 0 && (
-          <section className="background-rail">
-            <div className="section-title">
-              <span className="background-rail-title">
-                <span className="background-pulse" aria-hidden="true" />
-                Running now
-              </span>
-              <small>{backgroundAgents.length}</small>
-            </div>
-            <div className="background-rail-list">
-              {backgroundAgents.map((agent) => {
-                const probe = agent.kind === 'shell' ? backgroundProbes[agent.detail] : null
-                const percent = typeof probe?.percent === 'number' ? probe.percent : null
-                return (
-                  <div className="background-item" key={agent.id}>
-                    <Ring percent={percent} />
-                    <div className="background-item-body">
-                      <strong title={agent.name}>{agent.name}</strong>
-                      <div className="background-item-meta" key={tick}>
-                        {percent === null
-                          ? <span>{elapsedLabel(agent.startedAt)}</span>
-                          : <span className="background-percent">{percent}%</span>}
-                        <span className="background-dot-sep">·</span>
-                        <span>
-                          {probe?.eta
-                            ? `${probe.eta} left`
-                            : (percent === null ? 'no progress reported' : elapsedLabel(agent.startedAt))}
-                        </span>
-                      </div>
-                      <div className="background-bar">
-                        <span
-                          className={percent === null ? 'indeterminate' : ''}
-                          style={percent === null ? undefined : { width: `${percent}%` }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </section>
-        )}
-
         <div className="search-box">
           <Search size={14} />
           <input
@@ -2459,7 +2659,7 @@ function App() {
             <span>{auth?.login || 'Connecting to Copilot'}</span>
           </div>
           <div className="creator-credit">
-            <span>Made by Hsuan C and Copilot</span>
+            <span>Made by Hsuan C</span>
             <button onClick={() => api.openGitHub()}>GitHub</button>
           </div>
         </footer>
@@ -2578,6 +2778,47 @@ function App() {
             </div>
           </div>
         </header>
+
+        {backgroundAgents.length > 0 && (
+          <aside className="background-hud" aria-label="Background work in this chat">
+            <div className="background-hud-head">
+              <span className="background-pulse" aria-hidden="true" />
+              Running in this chat
+              <small>{backgroundAgents.length}</small>
+            </div>
+            <div className="background-hud-list">
+              {backgroundAgents.map((agent) => {
+                const probe = agent.kind === 'shell' ? backgroundProbes[agent.detail] : null
+                const percent = typeof probe?.percent === 'number' ? probe.percent : null
+                return (
+                  <div className="background-item" key={agent.id}>
+                    <Ring percent={percent} />
+                    <div className="background-item-body">
+                      <strong title={agent.name}>{agent.name}</strong>
+                      <div className="background-item-meta" key={tick}>
+                        {percent === null
+                          ? <span>{elapsedLabel(agent.startedAt)}</span>
+                          : <span className="background-percent">{percent}%</span>}
+                        <span className="background-dot-sep">·</span>
+                        <span>
+                          {probe?.eta
+                            ? `${probe.eta} left`
+                            : (percent === null ? 'still working' : elapsedLabel(agent.startedAt))}
+                        </span>
+                      </div>
+                      <div className="background-bar">
+                        <span
+                          className={percent === null ? 'indeterminate' : ''}
+                          style={percent === null ? undefined : { width: `${percent}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </aside>
+        )}
 
         {selected && (resources.length > 0 || railOpen) && (
           <div className={`resource-rail ${railOpen ? 'open' : ''}`}>
@@ -2851,7 +3092,45 @@ function App() {
         )}
 
         {selected && (
-          <div className="composer-wrap">
+          <div className="composer-wrap" ref={composerWrapRef}>
+            {paletteOpen && (
+              <div className="command-palette" role="listbox" aria-label="Commands">
+                <div className="command-palette-head">
+                  <span>{paletteQuery ? `Matching “${paletteQuery}”` : 'Commands and skills'}</span>
+                  <small>{paletteMatches.length}</small>
+                </div>
+                <div className="command-palette-list">
+                  {paletteMatches.map((command, index) => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={index === Math.min(paletteIndex, paletteMatches.length - 1)}
+                      className={`command-row ${index === Math.min(paletteIndex, paletteMatches.length - 1) ? 'active' : ''}`}
+                      key={`${command.kind}:${command.name}`}
+                      ref={index === Math.min(paletteIndex, paletteMatches.length - 1) ? activeRowRef : null}
+                      onMouseEnter={() => setPaletteIndex(index)}
+                      onMouseDown={(event) => {
+                        // Keep focus in the textarea so the blur handler does not close us first.
+                        event.preventDefault()
+                        applyCommand(command)
+                      }}
+                    >
+                      <span className={`command-kind ${command.kind}`}>
+                        {command.kind === 'skill' ? 'skill' : 'cmd'}
+                      </span>
+                      <span className="command-name">
+                        /{command.name}
+                        {command.hint && <em>{command.hint}</em>}
+                      </span>
+                      <span className="command-desc">{command.description}</span>
+                    </button>
+                  ))}
+                </div>
+                <div className="command-palette-foot">
+                  <kbd>↑↓</kbd> move <kbd>Tab</kbd> complete <kbd>Esc</kbd> close
+                </div>
+              </div>
+            )}
             {!!selectedQueue.length && (
               <div className="queue-strip">
                 <div className="queue-heading">
@@ -2902,7 +3181,15 @@ function App() {
               )}
               <textarea
                 value={message}
-                onChange={(event) => setMessage(event.target.value)}
+                onChange={(event) => {
+                  setMessage(event.target.value)
+                  setPaletteQuery(slashQueryAt(event.target.value, event.target.selectionStart))
+                  setPaletteIndex(0)
+                }}
+                onSelect={(event) => {
+                  setPaletteQuery(slashQueryAt(event.target.value, event.target.selectionStart))
+                }}
+                onBlur={() => setPaletteQuery(null)}
                 onPaste={handleComposerPaste}
                 onCompositionStart={() => { composingRef.current = true }}
                 onCompositionEnd={() => {
@@ -2916,6 +3203,31 @@ function App() {
                     event.keyCode === 229 ||
                     Date.now() - compositionEndedAtRef.current < 250
                   ) return
+                  if (paletteOpen) {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault()
+                      setPaletteIndex((index) => (index + 1) % paletteMatches.length)
+                      return
+                    }
+                    if (event.key === 'ArrowUp') {
+                      event.preventDefault()
+                      setPaletteIndex((index) => (index - 1 + paletteMatches.length) % paletteMatches.length)
+                      return
+                    }
+                    if (event.key === 'Escape') {
+                      event.preventDefault()
+                      setPaletteQuery(null)
+                      return
+                    }
+                    // Tab always completes. Enter completes too, unless the name is already
+                    // exact, in which case it sends so a quick "/env" then Enter just runs.
+                    const exact = activeMatch && paletteQuery === activeMatch.name
+                    if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey && !exact)) {
+                      event.preventDefault()
+                      applyCommand(activeMatch)
+                      return
+                    }
+                  }
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault()
                     sendMessage()

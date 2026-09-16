@@ -438,7 +438,9 @@ async function probeDetachedShell(shellId) {
   const escaped = shellId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const namePattern = new RegExp(`^${DETACHED_PREFIX}${escaped}-\\d{10,}-[^-]`)
   const logs = entries.filter((name) => name.endsWith('.log') && namePattern.test(name))
-  if (!logs.length) return null
+  // No log at all means the temp files were already cleaned up, so the command is long gone.
+  // Callers use this to clear ghosts left behind when a completion notice was never recorded.
+  if (!logs.length) return { shellId, missing: true, finished: true, percent: null, eta: '' }
 
   let newest = null
   for (const name of logs) {
@@ -601,8 +603,70 @@ ipcMain.handle('copilot:send-message', async (_event, { sessionId, prompt, attac
   }
 })
 
-ipcMain.handle('copilot:abort-session', async (_event, sessionId) => {
+// Slash commands come straight from the runtime, so the palette lists exactly what this
+// session can run: built-ins plus every discovered skill.
+ipcMain.handle('copilot:list-commands', async (_event, sessionId) => {
   try {
+    const session = await resumeSession(sessionId)
+    const list = await session.rpc.commands.list({
+      includeBuiltins: true,
+      includeSkills: true,
+      includeClientCommands: true,
+    })
+    return {
+      ok: true,
+      commands: (list.commands || []).map((command) => ({
+        name: command.name,
+        kind: command.kind,
+        description: command.description || '',
+        aliases: command.aliases || [],
+        hint: command.input?.hint || '',
+        requiresInput: Boolean(command.input?.required),
+        allowDuringAgentExecution: Boolean(command.allowDuringAgentExecution),
+      })),
+    }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+// Invoking returns one of several shapes. Only two matter to this UI: text to print, or a
+// prompt to hand to the agent. Everything else is reported as handled with no output.
+ipcMain.handle('copilot:invoke-command', async (_event, { sessionId, name, input }) => {
+  try {
+    const session = await resumeSession(sessionId)
+    const result = await session.rpc.commands.invoke({ name, input: input || '' })
+    if (result?.kind === 'text') {
+      return { ok: true, outcome: 'text', text: result.text || '' }
+    }
+    if (result?.kind === 'agent-prompt') {
+      const messageId = await session.send({ prompt: result.prompt })
+      return {
+        ok: true,
+        outcome: 'prompt',
+        messageId,
+        displayPrompt: result.displayPrompt || '',
+        notice: result.notice || '',
+      }
+    }
+    if (result?.kind === 'set-model') {
+      return { ok: true, outcome: 'text', text: `Model set to ${result.model}.` }
+    }
+    if (result?.kind === 'select-subcommand') {
+      const options = (result.options || []).map((option) => `/${result.command} ${option.name || option}`)
+      return {
+        ok: true,
+        outcome: 'text',
+        text: `${result.title || 'Pick one'}\n\n${options.join('\n')}`,
+      }
+    }
+    return { ok: true, outcome: 'done' }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+ipcMain.handle('copilot:abort-session', async (_event, sessionId) => {  try {
     const active = activeSessions.get(sessionId)
     if (!active) return { ok: false, error: { message: 'Session is not running.' } }
     await active.session.abort()
