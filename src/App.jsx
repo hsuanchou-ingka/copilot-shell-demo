@@ -116,10 +116,20 @@ function projectName(session) {
   return folderLabel(directory)
 }
 
-const URL_PATTERN = /https?:\/\/[^\s<>()[\]"'`]+/g
-const PATH_PATTERN = /(?:^|[\s(`'"])(\/(?:Users|Volumes|opt|srv|Applications)\/[^\s`'")\]]+)/g
-const FILE_EXTENSION_PATTERN = /\.[a-z0-9]{1,6}$/i
+const URL_PATTERN = /https?:\/\/[^\s<>()[\]"'`*]+/g
+const PATH_PATTERN = /(?:^|[\s(`'"])(\/(?:Users|Volumes|opt|srv|Applications)\/[^\s`'")\]*]+)/g
+const FILE_EXTENSION_PATTERN = /\.([a-z0-9]{1,6})$/i
+const KNOWN_EXTENSIONS = new Set([
+  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'json', 'css', 'scss', 'html', 'svg',
+  'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'sh', 'zsh', 'yml', 'yaml',
+  'md', 'mdx', 'txt', 'pdf', 'csv', 'xlsx', 'docx', 'pptx', 'key',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'icns', 'ico', 'mp3', 'mp4', 'm4a',
+  'wav', 'mov', 'zip', 'dmg', 'log', 'env', 'lock', 'toml', 'sql', 'db',
+])
 const NOTION_HASH_PATTERN = /-?[0-9a-f]{32}$/i
+// URLs pasted mid-sentence pick up trailing punctuation, in either script.
+const TRAILING_NOISE_PATTERN = /[.,;:!?)\]}'"`*。，、；：！？）】」』…]+$/
+const CJK_PATTERN = /[^\u0020-\u007e]/
 const NOISE_HOSTS = [
   'stackoverflow.com',
   'developer.mozilla.org',
@@ -129,7 +139,13 @@ const NOISE_HOSTS = [
 ]
 
 function trimTrailingPunctuation(value) {
-  return value.replace(/[.,;:!?)\]}'"`]+$/, '')
+  let result = value
+  let previous
+  do {
+    previous = result
+    result = result.replace(TRAILING_NOISE_PATTERN, '')
+  } while (result !== previous)
+  return result
 }
 
 function decodeSlug(slug) {
@@ -138,6 +154,16 @@ function decodeSlug(slug) {
   } catch {
     return slug
   }
+}
+
+// A path or URL that runs straight into CJK text was never really part of it.
+function cutAtNonAscii(value) {
+  const match = CJK_PATTERN.exec(value)
+  return match ? value.slice(0, match.index) : value
+}
+
+function cleanReference(value) {
+  return trimTrailingPunctuation(cutAtNonAscii(decodeSlug(value)))
 }
 
 // Notion puts the page title in the URL slug, so a readable label needs no network call.
@@ -149,11 +175,15 @@ function notionLabel(url) {
 
 function githubLabel(url) {
   const parts = url.pathname.split('/').filter(Boolean)
-  if (parts.length < 2) return parts[0] || 'GitHub'
-  const repo = `${parts[0]}/${parts[1]}`
-  if (parts[2] === 'pull' && parts[3]) return `${repo}#${parts[3]}`
-  if (parts[2] === 'issues' && parts[3]) return `${repo}#${parts[3]}`
-  return repo
+  if (!parts.length) return { label: 'GitHub', source: 'GitHub' }
+  if (parts.length === 1) return { label: parts[0], source: 'GitHub profile' }
+  const repo = parts[1]
+  if (parts[2] === 'pull' && parts[3]) return { label: `${repo} #${parts[3]}`, source: 'Pull request' }
+  if (parts[2] === 'issues' && parts[3]) return { label: `${repo} #${parts[3]}`, source: 'Issue' }
+  if (parts[2] === 'blob' && parts.length > 4) {
+    return { label: `${repo}/${parts.at(-1)}`, source: 'GitHub file' }
+  }
+  return { label: repo, source: 'Repository' }
 }
 
 function figmaLabel(url) {
@@ -174,7 +204,7 @@ function classifyLink(rawUrl) {
     return { kind: 'notion', label: notionLabel(url), source: 'Notion' }
   }
   if (host === 'github.com' || host.endsWith('.github.com')) {
-    return { kind: 'github', label: githubLabel(url), source: 'GitHub' }
+    return { kind: 'github', ...githubLabel(url) }
   }
   if (host.endsWith('figma.com')) {
     return { kind: 'figma', label: figmaLabel(url), source: 'Figma' }
@@ -185,12 +215,53 @@ function classifyLink(rawUrl) {
 function classifyPath(rawPath) {
   const name = folderLabel(rawPath)
   if (!name) return null
-  const isFile = FILE_EXTENSION_PATTERN.test(name)
+  const extension = FILE_EXTENSION_PATTERN.exec(name)?.[1]?.toLowerCase()
+  const isFile = Boolean(extension && KNOWN_EXTENSIONS.has(extension))
   return {
     kind: isFile ? 'file' : 'folder',
     label: name,
     source: isFile ? 'File' : 'Folder',
   }
+}
+
+function parentOf(rawPath) {
+  const parts = rawPath.split('/').filter(Boolean)
+  if (parts.length < 2) return ''
+  return `/${parts.slice(0, -1).join('/')}`
+}
+
+// One folder that holds several files reads better than a list of siblings.
+function groupByFolder(items, workingDirectory) {
+  const byParent = new Map()
+  items.forEach((item) => {
+    if (item.manual || item.root || (item.kind !== 'file' && item.kind !== 'folder')) return
+    const parent = parentOf(item.value)
+    if (!parent || parent === workingDirectory) return
+    if (!byParent.has(parent)) byParent.set(parent, [])
+    byParent.get(parent).push(item)
+  })
+
+  const absorbed = new Set()
+  const groups = []
+  byParent.forEach((siblings, parent) => {
+    if (siblings.length < 2) return
+    siblings.forEach((item) => absorbed.add(item.value))
+    groups.push({
+      id: parent,
+      value: parent,
+      kind: 'folder',
+      label: folderLabel(parent),
+      source: `Folder · ${siblings.length} items`,
+      count: siblings.reduce((total, item) => total + item.count, 0),
+      order: Math.max(...siblings.map((item) => item.order)),
+      children: siblings,
+    })
+  })
+
+  if (!groups.length) return items
+  const kept = items.filter((item) => !absorbed.has(item.value))
+  const existing = new Set(kept.map((item) => item.value))
+  return [...kept, ...groups.filter((group) => !existing.has(group.value))]
 }
 
 // Resources are read back out of the transcript, so nothing extra has to be stored per turn.
@@ -212,17 +283,17 @@ function collectResources(messages, workingDirectory) {
     if (!content) return
     const urls = content.match(URL_PATTERN) || []
     urls.forEach((raw) => {
-      const value = trimTrailingPunctuation(raw)
+      const value = cleanReference(raw)
       remember(value, classifyLink(value), index)
     })
     for (const match of content.matchAll(PATH_PATTERN)) {
-      const value = trimTrailingPunctuation(match[1])
-      if (value === workingDirectory) continue
+      const value = cleanReference(match[1])
+      if (!value || value === workingDirectory) continue
       remember(value, classifyPath(value), index)
     }
   })
 
-  const list = [...found.values()].sort((a, b) => {
+  const list = groupByFolder([...found.values()], workingDirectory).sort((a, b) => {
     if (b.count !== a.count) return b.count - a.count
     return b.order - a.order
   })
@@ -1877,7 +1948,12 @@ function App() {
                 {resources.map((item) => (
                   <div className="rail-row" key={item.id}>
                     <span className={`rail-dot kind-${item.kind}`} />
-                    <button type="button" className="rail-row-label" onClick={() => openResource(item)}>
+                    <button
+                      type="button"
+                      className="rail-row-label"
+                      onClick={() => openResource(item)}
+                      title={item.value}
+                    >
                       {item.label}
                     </button>
                     <span className="rail-source">{item.source}</span>

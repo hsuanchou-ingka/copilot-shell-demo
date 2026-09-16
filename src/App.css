@@ -978,11 +978,15 @@ button {
   overflow: hidden;
   white-space: nowrap;
   text-align: left;
+  text-decoration: underline;
+  text-decoration-color: #cdc8bf;
+  text-underline-offset: 3px;
   text-overflow: ellipsis;
 }
 
 .rail-row-label:hover {
-  text-decoration: underline;
+  color: #1f1c17;
+  text-decoration-color: #6f6bd8;
 }
 
 .rail-source {
