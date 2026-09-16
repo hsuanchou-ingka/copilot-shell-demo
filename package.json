@@ -1,6 +1,6 @@
 {
   "name": "copilot-workbench",
-  "productName": "Co-piloted by HC",
+  "productName": "HC Copilot",
   "private": true,
   "version": "0.1.0",
   "description": "A native multi-session desktop client for GitHub Copilot CLI.",
@@ -35,7 +35,7 @@
   },
   "build": {
     "appId": "com.hsuanchou.copilot-workbench",
-    "productName": "Co-piloted by HC",
+    "productName": "HC Copilot",
     "directories": {
       "output": "release"
     },

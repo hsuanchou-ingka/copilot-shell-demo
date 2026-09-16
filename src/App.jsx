@@ -30,7 +30,13 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-const EMPTY_SESSION_STATE = { working: false, liveText: '', toolActivity: [], backgroundAgents: [] }
+const EMPTY_SESSION_STATE = {
+  working: false,
+  liveText: '',
+  toolActivity: [],
+  backgroundAgents: [],
+  pendingTools: {},
+}
 const EMPTY_QUEUE = []
 const EMPTY_EDITS = Object.freeze({ hidden: [], manual: [], labels: {} })
 const PROJECT_PREVIEW_COUNT = 8
@@ -357,6 +363,130 @@ function collectResources(messages, workingDirectory) {
     })
   }
   return list
+}
+
+const SHELL_STARTED_RE = /<command started in (?:detached )?background with shellId: ([^>]+)>/g
+const SHELL_RUNNING_RE = /<command with shellId: (.+?) is still running/g
+const SHELL_DONE_RE = /<shellId: (.+?) completed with exit code/g
+const NOTIFY_DONE_RE = /\(shellId: ([^)]+)\)\s+has completed/g
+
+function matchAll(text, regex) {
+  const found = []
+  regex.lastIndex = 0
+  let match = regex.exec(text)
+  while (match) {
+    found.push(match[1].trim())
+    match = regex.exec(text)
+  }
+  return found
+}
+
+function resultText(data) {
+  const result = data?.result
+  if (!result) return ''
+  if (typeof result === 'string') return result
+  return `${result.content || ''}\n${result.detailedContent || ''}`
+}
+
+function eventTime(event) {
+  const parsed = Date.parse(event?.timestamp || '')
+  return Number.isNaN(parsed) ? Date.now() : parsed
+}
+
+// Folds one event into the background activity state. Shared by the live stream and
+// by history replay, so reopening a session rebuilds work that is still running.
+function foldBackgroundActivity(state, event) {
+  const type = event?.type
+  const data = event?.data || {}
+  const drop = (id) => state.backgroundAgents.filter((item) => item.id !== id)
+
+  if (type === 'tool.execution_start') {
+    const args = data.arguments || {}
+    return {
+      ...state,
+      pendingTools: {
+        ...state.pendingTools,
+        [data.toolCallId]: {
+          toolName: data.toolName,
+          shellId: args.shellId,
+          label: args.description || args.command || 'Background command',
+          startedAt: eventTime(event),
+        },
+      },
+    }
+  }
+
+  if (type === 'tool.execution_complete') {
+    const pending = state.pendingTools[data.toolCallId]
+    const rest = { ...state.pendingTools }
+    delete rest[data.toolCallId]
+    const text = resultText(data)
+    let agents = state.backgroundAgents
+
+    if (pending?.toolName === 'stop_bash' && pending.shellId) {
+      agents = agents.filter((item) => item.id !== `shell:${pending.shellId}`)
+    }
+    for (const shellId of matchAll(text, SHELL_DONE_RE)) {
+      agents = agents.filter((item) => item.id !== `shell:${shellId}`)
+    }
+    const running = [...matchAll(text, SHELL_STARTED_RE), ...matchAll(text, SHELL_RUNNING_RE)]
+    for (const shellId of running) {
+      const id = `shell:${shellId}`
+      if (agents.some((item) => item.id === id)) continue
+      agents = [...agents, {
+        id,
+        kind: 'shell',
+        name: pending?.label || `Shell ${shellId}`,
+        detail: shellId,
+        startedAt: pending?.startedAt || eventTime(event),
+      }]
+    }
+    return { ...state, pendingTools: rest, backgroundAgents: agents }
+  }
+
+  if (type === 'system.notification') {
+    const text = String(data.content || '')
+    let agents = state.backgroundAgents
+    for (const shellId of matchAll(text, NOTIFY_DONE_RE)) {
+      agents = agents.filter((item) => item.id !== `shell:${shellId}`)
+    }
+    return agents === state.backgroundAgents ? state : { ...state, backgroundAgents: agents }
+  }
+
+  if (type === 'subagent.started' && data.executionMode === 'background') {
+    const id = `agent:${data.toolCallId}`
+    if (!data.toolCallId || state.backgroundAgents.some((item) => item.id === id)) return state
+    return {
+      ...state,
+      backgroundAgents: [...state.backgroundAgents, {
+        id,
+        kind: 'agent',
+        name: data.agentDisplayName || data.agentName || 'Background agent',
+        detail: data.model || '',
+        startedAt: eventTime(event),
+      }],
+    }
+  }
+
+  if (type === 'subagent.completed' || type === 'subagent.failed') {
+    return { ...state, backgroundAgents: drop(`agent:${data.toolCallId}`) }
+  }
+
+  return state
+}
+
+// Replaying old logs can leave ghosts, because a session that was killed mid-run never
+// records its completion notices. Only trust a replay when the log was active recently.
+const REPLAY_FRESHNESS_MS = 30 * 60 * 1000
+
+function backgroundActivityFromEvents(events) {
+  let state = { pendingTools: {}, backgroundAgents: [] }
+  for (const event of events || []) state = foldBackgroundActivity(state, event)
+  const last = events?.length ? eventTime(events[events.length - 1]) : 0
+  if (Date.now() - last > REPLAY_FRESHNESS_MS) {
+    return { pendingTools: {}, backgroundAgents: [] }
+  }
+  return state
 }
 
 function elapsedLabel(startedAt) {
@@ -1089,30 +1219,11 @@ function App() {
           )),
         }))
       }
-      if (event.type === 'subagent.started' && event.data?.executionMode === 'background') {
-        patchSessionState(sessionId, (current) => {
-          const id = event.data?.toolCallId
-          if (!id || current.backgroundAgents.some((item) => item.id === id)) return current
-          return {
-            ...current,
-            backgroundAgents: [...current.backgroundAgents, {
-              id,
-              name: event.data?.agentDisplayName || event.data?.agentName || 'Background agent',
-              description: event.data?.agentDescription || '',
-              model: event.data?.model || '',
-              startedAt: Date.now(),
-            }],
-          }
-        })
-      }
-      if (event.type === 'subagent.completed' || event.type === 'subagent.failed') {
-        patchSessionState(sessionId, (current) => ({
-          ...current,
-          backgroundAgents: current.backgroundAgents.filter((item) => item.id !== event.data?.toolCallId),
-        }))
-      }
+      patchSessionState(sessionId, (current) => foldBackgroundActivity(current, event))
+
       if (event.type === 'session.idle') {
-        patchSessionState(sessionId, { liveText: '', toolActivity: [], backgroundAgents: [] })
+        // Background shells and agents outlive a turn, so they are never cleared here.
+        patchSessionState(sessionId, { liveText: '', toolActivity: [] })
         // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
         if (!drainQueueRef.current(sessionId)) {
           patchSessionState(sessionId, { working: false })
@@ -1206,13 +1317,16 @@ function App() {
         return
       }
       setMessages(messagesFromEvents(result.events))
+      // Rebuild work that was already running before this session was opened.
+      const activity = backgroundActivityFromEvents(result.events)
+      patchSessionState(selectedId, activity)
       const current = result.currentModel
       if (current?.modelId) setSelectedModel(current.modelId)
     }).catch((e) => showError(e?.message || String(e)))
     return () => {
       active = false
     }
-  }, [api, selectedId, showError])
+  }, [api, patchSessionState, selectedId, showError])
 
   useEffect(() => {
     if (!restoredSelectionRef.current) return
@@ -2001,7 +2115,7 @@ function App() {
                   </div>
                 )
               ) : (
-                <strong>Co-piloted by HC</strong>
+                <strong>HC Copilot</strong>
               )}
               <small>
                 {selected
@@ -2255,8 +2369,11 @@ function App() {
                       <strong>{agent.name}</strong>
                       <small key={tick}>{elapsedLabel(agent.startedAt)}</small>
                     </div>
-                    {agent.description && <p>{agent.description}</p>}
-                    {agent.model && <span className="background-model">{agent.model}</span>}
+                    {agent.detail && (
+                      <span className="background-model">
+                        {agent.kind === 'shell' ? `shell: ${agent.detail}` : agent.detail}
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>

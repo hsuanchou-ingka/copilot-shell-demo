@@ -1,4 +1,4 @@
-# Co-piloted by HC
+# HC Copilot
 
 A desktop client for GitHub Copilot CLI, built for people who run more than one conversation at a time.
 
@@ -77,7 +77,7 @@ This produces a `.dmg` and a `.zip` in `release/`. The build is unsigned, so the
 To install it into `/Applications`:
 
 ```bash
-ditto "release/mac-arm64/Co-piloted by HC.app" "/Applications/Co-piloted by HC.app"
+ditto "release/mac-arm64/HC Copilot.app" "/Applications/HC Copilot.app"
 ```
 
 ## How it is put together

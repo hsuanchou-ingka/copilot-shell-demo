@@ -190,7 +190,7 @@ async function getGitHubToken() {
     }
   }
 
-  throw new Error('GitHub CLI is not logged in. Run gh auth login, then reopen Co-piloted by HC.')
+  throw new Error('GitHub CLI is not logged in. Run gh auth login, then reopen HC Copilot.')
 }
 
 async function getClient() {
@@ -700,7 +700,7 @@ async function buildWindow() {
 function createMenu() {
   const template = [
     {
-      label: 'Co-piloted by HC',
+      label: 'HC Copilot',
       submenu: [
         { role: 'about' },
         { type: 'separator' },
@@ -783,7 +783,7 @@ if (hasSingleInstanceLock) {
     createMenu()
     createWindow().catch((e) => {
       appendLog(`could not create the window: ${e?.message || String(e)}`)
-      dialog.showErrorBox('Co-piloted by HC', e?.message || String(e))
+      dialog.showErrorBox('HC Copilot', e?.message || String(e))
     })
   })
 }
