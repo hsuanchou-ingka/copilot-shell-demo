@@ -29,6 +29,7 @@ import {
 import './App.css'
 
 const EMPTY_SESSION_STATE = { working: false, liveText: '', toolActivity: [] }
+const EMPTY_QUEUE = []
 const PROJECT_PREVIEW_COUNT = 8
 const ERROR_DISMISS_MS = 8000
 
@@ -432,6 +433,19 @@ function App() {
   const messageRef = useRef('')
   const attachmentsRef = useRef([])
   const [draftAttachmentCounts, setDraftAttachmentCounts] = useState({})
+  const queuesRef = useRef({})
+  const [queues, setQueues] = useState({})
+  const drainQueueRef = useRef(() => false)
+
+  // Queued messages are keyed by session so typing ahead in one never leaks into another.
+  const writeQueue = useCallback((sessionId, updater) => {
+    if (!sessionId) return
+    const current = queuesRef.current[sessionId] || []
+    const next = typeof updater === 'function' ? updater(current) : updater
+    if (next.length) queuesRef.current[sessionId] = next
+    else delete queuesRef.current[sessionId]
+    setQueues({ ...queuesRef.current })
+  }, [])
 
   useEffect(() => {
     if (!selectedId) return
@@ -513,6 +527,7 @@ function App() {
   const quotaSnapshot = quota?.premium_interactions || quota?.chat || null
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
+  const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
 
   const patchSessionState = useCallback((sessionId, patch) => {
     setSessionState((current) => {
@@ -746,13 +761,21 @@ function App() {
         }))
       }
       if (event.type === 'session.idle') {
-        patchSessionState(sessionId, { working: false, liveText: '', toolActivity: [] })
+        patchSessionState(sessionId, { liveText: '', toolActivity: [] })
+        // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
+        if (!drainQueueRef.current(sessionId)) {
+          patchSessionState(sessionId, { working: false })
+        }
         api.refreshQuota().then((result) => {
           if (result.ok) setQuota(result.quota)
         }).catch((e) => showError(e?.message || String(e)))
       }
       if (event.type === 'session.error') {
         patchSessionState(sessionId, { working: false })
+        queuesRef.current = Object.fromEntries(
+          Object.entries(queuesRef.current).filter(([key]) => key !== sessionId),
+        )
+        setQueues({ ...queuesRef.current })
         if (isSelected) showError(event.data?.message || 'The Copilot session reported an error.')
       }
     })
@@ -1027,38 +1050,28 @@ function App() {
     node.style.height = `${Math.min(node.scrollHeight, 200)}px`
   }, [message, selectedId])
 
-  const sendMessage = async () => {
-    const typedPrompt = message.trim()
-    if ((!typedPrompt && !attachments.length) || !selectedId || working) return
-    const prompt = typedPrompt || 'Please review the attached file.'
-    const sessionId = selectedId
-    const sentAttachments = attachments.map((item) => ({
-      type: 'file',
-      path: item.path,
-      displayName: item.displayName,
-      thumbnail: item.thumbnail,
-    }))
+  const deliverMessage = useCallback(async (sessionId, prompt, sentAttachments) => {
     const outgoing = sentAttachments.map(({ type, path: filePath, displayName }) => ({
       type,
       path: filePath,
       displayName,
     }))
     const optimisticId = `local-${crypto.randomUUID()}`
-    clearDraft(sessionId)
-    setError(null)
     patchSessionState(sessionId, { working: true })
-    setMessages((items) => [...items, {
-      id: optimisticId,
-      role: 'user',
-      content: prompt,
-      attachments: sentAttachments,
-      status: 'sending',
-      optimistic: true,
-    }])
+    if (selectedIdRef.current === sessionId) {
+      setMessages((items) => [...items, {
+        id: optimisticId,
+        role: 'user',
+        content: prompt,
+        attachments: sentAttachments,
+        status: 'sending',
+        optimistic: true,
+      }])
+    }
     const result = await api.sendMessage({ sessionId, prompt, attachments: outgoing })
     if (!result.ok) {
       patchSessionState(sessionId, { working: false })
-      restoreDraft(sessionId, { message: typedPrompt, attachments: sentAttachments })
+      restoreDraft(sessionId, { message: prompt, attachments: sentAttachments })
       if (selectedIdRef.current === sessionId) {
         setMessages((items) => items.map((item) => (
           item.id === optimisticId ? { ...item, status: 'failed', optimistic: false } : item
@@ -1072,6 +1085,47 @@ function App() {
         item.id === optimisticId && item.status === 'sending' ? { ...item, status: 'sent' } : item
       )))
     }
+  }, [api, patchSessionState, restoreDraft, showError])
+
+  const drainQueue = useCallback((sessionId) => {
+    const queue = queuesRef.current[sessionId]
+    if (!queue?.length) return false
+    const [next, ...rest] = queue
+    writeQueue(sessionId, rest)
+    deliverMessage(sessionId, next.prompt, next.attachments)
+    return true
+  }, [deliverMessage, writeQueue])
+
+  useEffect(() => {
+    drainQueueRef.current = drainQueue
+  }, [drainQueue])
+
+  const removeQueued = (sessionId, itemId) => {
+    writeQueue(sessionId, (items) => items.filter((item) => item.id !== itemId))
+  }
+
+  const sendMessage = () => {
+    const typedPrompt = message.trim()
+    if ((!typedPrompt && !attachments.length) || !selectedId) return
+    const prompt = typedPrompt || 'Please review the attached file.'
+    const sessionId = selectedId
+    const sentAttachments = attachments.map((item) => ({
+      type: 'file',
+      path: item.path,
+      displayName: item.displayName,
+      thumbnail: item.thumbnail,
+    }))
+    clearDraft(sessionId)
+    setError(null)
+    if (working) {
+      writeQueue(sessionId, (items) => [...items, {
+        id: crypto.randomUUID(),
+        prompt,
+        attachments: sentAttachments,
+      }])
+      return
+    }
+    deliverMessage(sessionId, prompt, sentAttachments)
   }
 
   const stopSession = async () => {
@@ -1081,6 +1135,7 @@ function App() {
       showError(result.error?.message || 'Could not stop this session.')
       return
     }
+    writeQueue(selectedId, [])
     patchSessionState(selectedId, { working: false, liveText: '', toolActivity: [] })
   }
 
@@ -1130,6 +1185,7 @@ function App() {
       return next
     })
     delete draftsRef.current[sessionId]
+    writeQueue(sessionId, [])
     setDraftAttachmentCounts((current) => {
       const next = { ...current }
       delete next[sessionId]
@@ -1238,6 +1294,14 @@ function App() {
                 title={`${draftAttachmentCounts[session.id]} unsent attachment${draftAttachmentCounts[session.id] > 1 ? 's' : ''} waiting in this session`}
               >
                 <Paperclip size={9} />{draftAttachmentCounts[session.id]}
+              </span>
+            )}
+            {queues[session.id]?.length > 0 && (
+              <span
+                className="session-queue-badge"
+                title={`${queues[session.id].length} message${queues[session.id].length > 1 ? 's' : ''} queued in this session`}
+              >
+                {queues[session.id].length} queued
               </span>
             )}
             {sessionIsWorking(session.id) && (
@@ -1644,6 +1708,31 @@ function App() {
 
         {selected && (
           <div className="composer-wrap">
+            {!!selectedQueue.length && (
+              <div className="queue-strip">
+                <div className="queue-heading">
+                  Queued · sends when this turn finishes
+                </div>
+                {selectedQueue.map((item, index) => (
+                  <div className="queue-item" key={item.id}>
+                    <span className="queue-index">{index + 1}</span>
+                    <span className="queue-text">{item.prompt}</span>
+                    {!!item.attachments.length && (
+                      <span className="queue-attach">
+                        <Paperclip size={10} />{item.attachments.length}
+                      </span>
+                    )}
+                    <button
+                      onClick={() => removeQueued(selectedId, item.id)}
+                      aria-label={`Remove queued message ${index + 1}`}
+                      title="Remove from queue"
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className={`composer ${draggingFiles ? 'dragging-files' : ''}`} {...dropTargetHandlers}>
               {!!attachments.length && (
                 <div className="attachment-chips">
@@ -1688,7 +1777,9 @@ function App() {
                     sendMessage()
                   }
                 }}
-                placeholder="Ask Copilot to do anything on your computer..."
+                placeholder={working
+                  ? 'Type ahead. Enter adds it to the queue.'
+                  : 'Ask Copilot to do anything on your computer...'}
                 rows={1}
                 ref={composerRef}
               />
@@ -1700,15 +1791,20 @@ function App() {
                 </button>
               </div>
               <div className="composer-send-group">
-                {working ? (
+                {working && (
                   <button className="stop" onClick={stopSession} title="Stop" aria-label="Stop">
                     <Square size={12} /> Stop
                   </button>
-                ) : (
-                  <button className="send" onClick={sendMessage} disabled={!message.trim() && !attachments.length}>
-                    <Send size={14} />
-                  </button>
                 )}
+                <button
+                  className={`send ${working ? 'queueing' : ''}`}
+                  onClick={sendMessage}
+                  disabled={!message.trim() && !attachments.length}
+                  title={working ? 'Add to queue' : 'Send'}
+                  aria-label={working ? 'Add to queue' : 'Send'}
+                >
+                  <Send size={14} />
+                </button>
               </div>
             </div>
           </div>
