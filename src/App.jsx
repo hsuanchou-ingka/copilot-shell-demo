@@ -2,6 +2,14 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
+  beginPlanTurn,
+  createPlanLifecycleState,
+  finishPlanTurn,
+  getPlanForDisplay,
+  markPlanChanged,
+  observePlanRead,
+} from './plan-lifecycle.mjs'
+import {
   AlertTriangle,
   ArrowDown,
   CornerUpLeft,
@@ -62,7 +70,6 @@ const EMPTY_TODOS = []
 
 const KEEP_WORKING_PROMPT = 'keep working'
 const EMPTY_TASK_SNAPSHOT = { sessionId: null, tasks: EMPTY_TASKS }
-const EMPTY_PLAN = { sessionId: null, todos: EMPTY_TODOS }
 
 // A plan of one step is not a plan, and showing it would put a panel on screen for work that
 // needs no explaining.
@@ -78,14 +85,6 @@ function sameTaskList(a, b) {
   if (a === b) return true
   if (a.length !== b.length) return false
   return a.every((task, index) => task.id === b[index].id && task.intent === b[index].intent)
-}
-
-function sameTodoList(a, b) {
-  if (a === b) return true
-  if (a.length !== b.length) return false
-  return a.every((todo, index) => todo.id === b[index].id
-    && todo.status === b[index].status
-    && todo.title === b[index].title)
 }
 
 // The runtime writes whatever the agent put in the status column, so anything unrecognised is
@@ -194,6 +193,7 @@ function projectName(session) {
 
 const URL_PATTERN = /https?:\/\/[^\s<>()[\]"'`*]+/g
 const PATH_PATTERN = /(?:^|[\s(`'"])(\/(?:Users|Volumes|opt|srv|Applications)\/[^\s`'")\]*]+)/g
+const QUOTED_PATH_PATTERN = /["'\`](\/(?:Users|Volumes|opt|srv|Applications)\/[^"'\`]+)["'\`]/g
 const FILE_EXTENSION_PATTERN = /\.([a-z0-9]{1,6})$/i
 const KNOWN_EXTENSIONS = new Set([
   'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'json', 'css', 'scss', 'html', 'svg',
@@ -240,6 +240,22 @@ function cutAtNonAscii(value) {
 
 function cleanReference(value) {
   return trimTrailingPunctuation(cutAtNonAscii(decodeSlug(value)))
+}
+
+function cleanPathReference(value) {
+  // Local paths may contain Unicode folder and file names. The CJK boundary rule above is only
+  // suitable for URLs followed immediately by prose, so paths keep their decoded Unicode text.
+  return trimTrailingPunctuation(decodeSlug(value))
+}
+
+function pathReferencesIn(content) {
+  const quotedMatches = [...content.matchAll(QUOTED_PATH_PATTERN)]
+  const quotedRanges = quotedMatches.map((match) => [match.index, match.index + match[0].length])
+  const bare = [...content.matchAll(PATH_PATTERN)]
+    .filter((match) => !quotedRanges.some(([start, end]) => match.index >= start && match.index < end))
+    .map((match) => match[1])
+  const quoted = quotedMatches.map((match) => match[1])
+  return [...new Set([...bare, ...quoted].map(cleanPathReference))]
 }
 
 // Notion puts the page title in the URL slug, so a readable label needs no network call.
@@ -407,8 +423,7 @@ function collectResources(messages, workingDirectory) {
       const value = cleanReference(raw)
       remember(value, classifyLink(value), index)
     })
-    for (const match of content.matchAll(PATH_PATTERN)) {
-      const value = cleanReference(match[1])
+    for (const value of pathReferencesIn(content)) {
       if (!value || value === workingDirectory) continue
       remember(value, classifyPath(value), index)
     }
@@ -898,7 +913,17 @@ function withHardBreaks(text) {
 function openExternalLink(event, href) {
   event.preventDefault()
   if (!href) return
-  window.copilot?.openExternal(href)
+  Promise.resolve(window.copilot?.openExternal(href)).then((result) => {
+    if (result && !result.ok) {
+      window.dispatchEvent(new CustomEvent('copilot:external-error', {
+        detail: result.error?.message || 'Could not open that link.',
+      }))
+    }
+  }).catch((error) => {
+    window.dispatchEvent(new CustomEvent('copilot:external-error', {
+      detail: error?.message || String(error),
+    }))
+  })
 }
 
 const RUNNABLE_LANGUAGES = new Set(['bash', 'sh', 'shell', 'zsh', 'console', 'terminal'])
@@ -1319,7 +1344,7 @@ function App() {
   const [backgroundProbes, setBackgroundProbes] = useState({})
   const [commands, setCommands] = useState([])
   const [taskSnapshot, setTaskSnapshot] = useState(EMPTY_TASK_SNAPSHOT)
-  const [plan, setPlan] = useState(EMPTY_PLAN)
+  const [plan, setPlan] = useState(createPlanLifecycleState)
   const [planOpen, setPlanOpen] = useState(false)
   // Bumped by session.todos_changed so the plan re-reads on the runtime's signal rather than
   // on a timer.
@@ -1393,6 +1418,9 @@ function App() {
   const selectedIdRef = useRef(selectedId)
   const selectedModelRef = useRef(selectedModel)
   const selectedProjectRef = useRef(selectedProject)
+  const planTurnIdsRef = useRef({})
+  const planTurnActiveRef = useRef({})
+  const planReadIdsRef = useRef({})
   const atBottomRef = useRef(true)
   const searchInputRef = useRef(null)
   const conversationRef = useRef(null)
@@ -1454,6 +1482,27 @@ function App() {
   // Counts messages actually handed to the runtime, so a queue that empties can be told apart:
   // the runtime took it, or the user deleted it. Those need opposite handling.
   const deliveryCountRef = useRef({})
+
+  const beginPlanTurnForSession = useCallback((sessionId) => {
+    if (!sessionId || planTurnActiveRef.current[sessionId]) return
+    planTurnActiveRef.current[sessionId] = true
+    planTurnIdsRef.current[sessionId] = (planTurnIdsRef.current[sessionId] || 0) + 1
+    setPlan((current) => beginPlanTurn(current, sessionId).state)
+  }, [])
+
+  const finishPlanTurnForSession = useCallback((sessionId, expectedTurnId) => {
+    if (!sessionId) return
+    const turnId = planTurnIdsRef.current[sessionId] || 0
+    if (expectedTurnId !== undefined && expectedTurnId !== turnId) return
+    planTurnActiveRef.current[sessionId] = false
+    setPlan((current) => finishPlanTurn(current, { sessionId, turnId }))
+  }, [])
+
+  const markPlanChangedForSession = useCallback((sessionId) => {
+    if (!sessionId) return
+    const turnId = planTurnIdsRef.current[sessionId] || 0
+    setPlan((current) => markPlanChanged(current, { sessionId, turnId }))
+  }, [])
 
   const [resourceEdits, setResourceEdits] = useState(() => loadValue(RESOURCES_KEY, {}) || {})
   const [railOpen, setRailOpen] = useState(false)
@@ -1603,11 +1652,12 @@ function App() {
     [backgroundShells, tasksForSession],
   )
   const selectedQueue = (selectedId && queues[selectedId]) || EMPTY_QUEUE
+  const planTurnId = selectedId ? plan.sessions[selectedId]?.turnId || 0 : 0
 
   // What the plan panel needs to answer "how far in, how much left, what is live right now".
   // A finished plan is not shown: the panel means there is outstanding work, so it going away
   // is how the last step reads as done.
-  const planTodos = plan.sessionId === selectedId ? plan.todos : EMPTY_TODOS
+  const planTodos = getPlanForDisplay(plan, selectedId, working)
   const planView = useMemo(() => {
     if (planTodos.length < PLAN_MIN_STEPS) return null
     const doneCount = planTodos.filter(todoIsDone).length
@@ -1633,34 +1683,40 @@ function App() {
   }, [planTodos, working])
 
 
-  // The plan has to be read rather than waited for. session.todos_changed is documented as the
-  // signal for this and is the obvious thing to listen to, but the runtime does not send it: a
-  // turn that wrote three todos and ticked one off fired it zero times, so a panel built on it
-  // only ever showed whatever was true the moment the chat was opened. A plan left over from
-  // yesterday would sit there reading as live work.
-  //
-  // So it is read on a timer, but only while a turn is running, which is the only time the
-  // agent writes to the list. The effect re-runs when the turn ends, which takes the final
-  // state, and then stops polling an idle chat.
+  // Read the plan on a timer while a turn is running. The lifecycle reducer treats the first
+  // read as a baseline and only exposes a changed snapshot belonging to this turn.
   useEffect(() => {
     if (!api?.readTodos || !selectedId) return undefined
     let cancelled = false
+    const sessionId = selectedId
+    const turnId = planTurnIdsRef.current[sessionId] || 0
     const poll = () => {
-      api.readTodos(selectedId).then((result) => {
+      const readId = (planReadIdsRef.current[sessionId] || 0) + 1
+      planReadIdsRef.current[sessionId] = readId
+      api.readTodos(sessionId).then((result) => {
         if (cancelled) return
-        const next = result?.ok ? result.todos : EMPTY_TODOS
-        setPlan((current) => (
-          current.sessionId === selectedId && sameTodoList(current.todos, next)
-            ? current
-            : { sessionId: selectedId, todos: next }
-        ))
-      }).catch(() => {})
+        setPlan((current) => observePlanRead(current, {
+          sessionId,
+          turnId,
+          readId,
+          ok: Boolean(result?.ok),
+          todos: result?.todos,
+        }))
+      }).catch(() => {
+        if (cancelled) return
+        setPlan((current) => observePlanRead(current, {
+          sessionId,
+          turnId,
+          readId,
+          ok: false,
+        }))
+      })
     }
     poll()
     if (!working) return () => { cancelled = true }
     const timer = setInterval(poll, PLAN_POLL_MS)
     return () => { cancelled = true; clearInterval(timer) }
-  }, [api, selectedId, planRevision, working])
+  }, [api, planRevision, planTurnId, selectedId, working])
 
   // Poll the runtime task registry for this chat. agentHint bumps the poll the moment a
   // background agent starts, so the panel appears immediately instead of on the next tick.
@@ -1690,6 +1746,9 @@ function App() {
   useEffect(() => {
     if (!api?.listCommands || !selectedId) return undefined
     let cancelled = false
+    // Commands are session-scoped. Do not leave the previous session's palette actionable while
+    // the new session's command list is still loading.
+    setCommands([])
     api.listCommands(selectedId).then((result) => {
       if (cancelled || !result?.ok) return
       setCommands(result.commands || [])
@@ -1797,6 +1856,12 @@ function App() {
     const timer = setTimeout(() => setError(null), ERROR_DISMISS_MS)
     return () => clearTimeout(timer)
   }, [error])
+
+  useEffect(() => {
+    const onExternalError = (event) => showError(event.detail || 'Could not open that link.')
+    window.addEventListener('copilot:external-error', onExternalError)
+    return () => window.removeEventListener('copilot:external-error', onExternalError)
+  }, [showError])
 
   const projects = useMemo(() => {
     const byKey = new Map()
@@ -2022,10 +2087,14 @@ function App() {
       lastEventAtRef.current[sessionId] = Date.now()
       // Work under way clears the debounce below, so a turn that starts and ends quickly still
       // registers its own ending rather than being mistaken for an echo of the previous one.
-      if (TURN_ACTIVE_EVENTS.has(event.type)) turnEndedAtRef.current[sessionId] = 0
+      if (TURN_ACTIVE_EVENTS.has(event.type)) {
+        turnEndedAtRef.current[sessionId] = 0
+        beginPlanTurnForSession(sessionId)
+      }
       // Signal-only event: the plan changed and has to be re-read. Only the visible chat needs
       // to react, since the panel reads for whichever chat is selected.
-      if (event.type === 'session.todos_changed' && isSelected) {
+      if (event.type === 'session.todos_changed') {
+        markPlanChangedForSession(sessionId)
         setPlanRevision((value) => value + 1)
       }
 
@@ -2087,6 +2156,7 @@ function App() {
           turnEndedAtRef.current[sessionId] = now
           // Background shells and agents outlive a turn, so they are never cleared here.
           patchSessionState(sessionId, { liveText: '', toolActivity: [] })
+          finishPlanTurnForSession(sessionId)
           // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
           if (!drainQueueRef.current(sessionId)) {
             patchSessionState(sessionId, { working: false })
@@ -2104,6 +2174,7 @@ function App() {
         // runtime may even switch model and carry on. Deleting the queue here threw away
         // messages the user had already written over a blip they never chose, so the queue
         // stays. It is visible in the composer, so they can send it, edit it or drop it.
+        finishPlanTurnForSession(sessionId)
         patchSessionState(sessionId, {
           working: false, liveText: '', toolActivity: [], turnOutcome: 'failed',
         })
@@ -2187,7 +2258,7 @@ function App() {
       unsubscribeMetadata()
       unsubscribeCommands()
     }
-  }, [api, createSession, patchSessionState, showError])
+  }, [api, beginPlanTurnForSession, createSession, finishPlanTurnForSession, markPlanChangedForSession, patchSessionState, showError])
 
   useEffect(() => {
     if (!api || !selectedId) return
@@ -2216,6 +2287,7 @@ function App() {
       api.sessionBusy(selectedId).then((busy) => {
         if (!active || selectedIdRef.current !== selectedId) return
         if (!busy?.ok || !busy.busy) return
+        beginPlanTurnForSession(selectedId)
         patchSessionState(selectedId, (state) => (state.working ? state : {
           // No start time: this turn began before the window did, and a clock counting from
           // the moment we noticed would report a duration that is simply untrue.
@@ -2226,7 +2298,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [api, patchSessionState, selectedId, showError])
+  }, [api, beginPlanTurnForSession, patchSessionState, selectedId, showError])
 
   useEffect(() => {
     if (!restoredSelectionRef.current) return
@@ -2526,6 +2598,8 @@ function App() {
       displayName,
     }))
     const optimisticId = `local-${crypto.randomUUID()}`
+    beginPlanTurnForSession(sessionId)
+    const messageTurnId = planTurnIdsRef.current[sessionId] || 0
     patchSessionState(sessionId, {
       working: true, turnStartedAt: Date.now(), turnEndedAt: 0, turnOutcome: '',
     })
@@ -2554,6 +2628,7 @@ function App() {
       result = { ok: false, error: { message: error?.message || String(error) } }
     }
     if (!result?.ok) {
+      finishPlanTurnForSession(sessionId, messageTurnId)
       patchSessionState(sessionId, { working: false, turnOutcome: 'failed' })
       restoreDraft(sessionId, { message: prompt, attachments: sentAttachments })
       if (selectedIdRef.current === sessionId) {
@@ -2569,7 +2644,7 @@ function App() {
         item.id === optimisticId && item.status === 'sending' ? { ...item, status: 'sent' } : item
       )))
     }
-  }, [api, patchSessionState, restoreDraft, showError])
+  }, [api, beginPlanTurnForSession, finishPlanTurnForSession, patchSessionState, restoreDraft, showError])
 
   const drainQueue = useCallback((sessionId) => {
     const queue = queuesRef.current[sessionId]
@@ -2605,27 +2680,31 @@ function App() {
   useEffect(() => {
     if (!api?.sessionBusy || !selectedId || !working) return undefined
     let cancelled = false
+    const sessionId = selectedId
+    const turnId = planTurnIdsRef.current[sessionId] || 0
     // Two readings before acting, so a single odd answer cannot end a turn on its own.
     let quiet = 0
     const check = () => {
       // A turn that has only just been sent may not be on disk yet, and reading it now would
       // return the previous turn's ending.
-      if (Date.now() - (sentAtRef.current[selectedId] || 0) < RECONCILE_GRACE_MS) return
-      api.sessionBusy(selectedId).then((result) => {
+      if (Date.now() - (sentAtRef.current[sessionId] || 0) < RECONCILE_GRACE_MS) return
+      api.sessionBusy(sessionId).then((result) => {
         if (cancelled || !result?.ok) return
+        if (planTurnIdsRef.current[sessionId] !== turnId || !planTurnActiveRef.current[sessionId]) return
         if (result.busy) { quiet = 0; return }
         quiet += 1
         if (quiet < 2) return
         // The transcript says this turn ended. Anything queued behind it goes now, exactly as it
         // would have on a live ending.
-        if (!drainQueueRef.current(selectedId)) {
-          patchSessionState(selectedId, { working: false, liveText: '', toolActivity: [] })
+        finishPlanTurnForSession(sessionId, turnId)
+        if (!drainQueueRef.current(sessionId)) {
+          patchSessionState(sessionId, { working: false, liveText: '', toolActivity: [] })
         }
       }).catch(() => {})
     }
     const timer = window.setInterval(check, RECONCILE_EVERY_MS)
     return () => { cancelled = true; window.clearInterval(timer) }
-  }, [api, selectedId, working, patchSessionState])
+  }, [api, finishPlanTurnForSession, planTurnId, selectedId, working, patchSessionState])
 
   const removeQueued = (sessionId, itemId) => {
     writeQueue(sessionId, (items) => items.filter((item) => item.id !== itemId))
@@ -2633,12 +2712,14 @@ function App() {
 
   const openResource = (item) => {
     if (item.kind === 'folder' || item.kind === 'file') {
-      api.openPath(item.value).then((result) => {
+      Promise.resolve(api.openPath(item.value)).then((result) => {
         if (!result?.ok) showError(`Could not open ${item.value}`)
-      })
+      }).catch((error) => showError(error?.message || `Could not open ${item.value}`))
       return
     }
-    api.openExternal(item.value)
+    Promise.resolve(api.openExternal(item.value)).then((result) => {
+      if (result && !result.ok) showError(result.error?.message || `Could not open ${item.value}`)
+    }).catch((error) => showError(error?.message || `Could not open ${item.value}`))
   }
 
   const insertResource = (item) => {
@@ -2734,7 +2815,10 @@ function App() {
     // the ordinary end of the short turn the command itself opened.
     const settle = (outcome) => {
       if (wasWorking) patchSessionState(sessionId, { working: true })
-      else patchSessionState(sessionId, { working: false, ...(outcome ? { turnOutcome: outcome } : {}) })
+      else {
+        finishPlanTurnForSession(sessionId, commandTurnId)
+        patchSessionState(sessionId, { working: false, ...(outcome ? { turnOutcome: outcome } : {}) })
+      }
     }
 
     setMessages((items) => [...items, {
@@ -2745,10 +2829,13 @@ function App() {
       status: 'sent',
       commandEcho: true,
     }])
+    let commandTurnId
     if (!wasWorking) {
       patchSessionState(sessionId, {
         working: true, turnStartedAt: Date.now(), turnEndedAt: 0, turnOutcome: '',
       })
+      beginPlanTurnForSession(sessionId)
+      commandTurnId = (planTurnIdsRef.current[sessionId] || 0)
     }
 
     let result
@@ -2783,7 +2870,7 @@ function App() {
       }])
     }
     return true
-  }, [api, findCommand, patchSessionState, showError])
+  }, [api, beginPlanTurnForSession, findCommand, finishPlanTurnForSession, patchSessionState, showError])
 
   const sendMessage = () => {
     const typedPrompt = message.trim()
@@ -2834,6 +2921,7 @@ function App() {
   const stopSession = async () => {
     if (!selectedId) return
     const sessionId = selectedId
+    const turnId = planTurnIdsRef.current[sessionId] || 0
     // Remember what was at the front so the fallback below can tell whether it was picked up.
     const waitingId = queuesRef.current[sessionId]?.[0]?.id || null
     const deliveriesBefore = deliveryCountRef.current[sessionId] || 0
@@ -2847,6 +2935,7 @@ function App() {
     // Background shells and agents are detached from the turn and keep running after it ends,
     // so they stay listed here exactly as they do on a normal idle. Their own liveness checks
     // drop them when they actually finish.
+    finishPlanTurnForSession(sessionId, turnId)
     patchSessionState(sessionId, { liveText: '', toolActivity: [] })
     if (!waitingId) {
       patchSessionState(sessionId, { working: false, turnOutcome: 'stopped' })
@@ -3611,7 +3700,12 @@ function App() {
                 Open
               </button>
               {(railMenu.item.kind === 'folder' || railMenu.item.kind === 'file') && (
-                <button type="button" onClick={() => { api.revealPath(railMenu.item.value); setRailMenu(null) }}>
+                <button type="button" onClick={() => {
+                  Promise.resolve(api.revealPath(railMenu.item.value)).then((result) => {
+                    if (!result?.ok) showError(`Could not reveal ${railMenu.item.value}`)
+                  }).catch((error) => showError(error?.message || `Could not reveal ${railMenu.item.value}`))
+                  setRailMenu(null)
+                }}>
                   Show in Finder
                 </button>
               )}

@@ -7,9 +7,13 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { CopilotClient } from '@github/copilot-sdk'
+import { dropDisconnectedClient, getReusableSession } from './client-cache.mjs'
+import { isOwnAppPage, isTrustedRendererEvent, registerIpcHandle as registerSecureIpcHandle } from './security.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isDev = !app.isPackaged
+const DEV_ORIGIN = 'http://127.0.0.1:5173'
+const PACKAGED_ENTRY_FILE = path.resolve(__dirname, '..', 'dist', 'index.html')
 const execFileAsync = promisify(execFile)
 const CLAUDE_AGENTS_DIRECTORY = path.join(app.getPath('home'), '.claude', 'agents')
 const SHARED_SKILLS_DIRECTORY = path.join(app.getPath('home'), '.agents', 'skills')
@@ -206,7 +210,15 @@ async function getGitHubToken() {
   throw new Error('GitHub CLI is not logged in. Run gh auth login, then reopen HC Copilot.')
 }
 
+function discardDisconnectedClient() {
+  if (dropDisconnectedClient(client, activeSessions)) {
+    appendLog('discarding disconnected Copilot client and session handles')
+    client = undefined
+  }
+}
+
 async function getClient() {
+  discardDisconnectedClient()
   if (client) return client
   if (!startingClient) {
     startingClient = (async () => {
@@ -339,8 +351,11 @@ function refuseIfDeleting(sessionId) {
 
 async function resumeSession(sessionId) {
   refuseIfDeleting(sessionId)
-  const active = activeSessions.get(sessionId)
-  if (active) return active.session
+  // Check the cached SDK state before returning a handle. The SDK clears its own session map
+  // when the transport closes, while this process retains its wrapper map until this point.
+  discardDisconnectedClient()
+  const active = getReusableSession(client, activeSessions, sessionId)
+  if (active) return active
 
   const pending = resumingSessions.get(sessionId)
   // Awaited rather than returned, so a deletion that begins while this resume is in flight is
@@ -382,7 +397,7 @@ async function getQuota(copilot) {
   }
 }
 
-ipcMain.handle('copilot:initialize', async () => {
+registerIpcHandle('copilot:initialize', async () => {
   try {
     const copilot = await getClient()
     const [auth, models, sessions, quota, skills, mcp, customAgents] = await Promise.all([
@@ -418,7 +433,7 @@ ipcMain.handle('copilot:initialize', async () => {
   }
 })
 
-ipcMain.handle('copilot:instruction-files', async (_event, workingDirectory) => {
+registerIpcHandle('copilot:instruction-files', async (_event, workingDirectory) => {
   try {
     return { ok: true, files: collectInstructionFiles(workingDirectory) }
   } catch (error) {
@@ -532,7 +547,7 @@ async function probeDetachedShell(shellId, entries) {
   return { shellId, finished, updatedAt: newest.mtimeMs, ...progress }
 }
 
-ipcMain.handle('copilot:probe-background', async (_event, shellIds) => {
+registerIpcHandle('copilot:probe-background', async (_event, shellIds) => {
   try {
     const list = Array.isArray(shellIds) ? shellIds.filter(Boolean).slice(0, 24) : []
     if (!list.length) return { ok: true, report: {} }
@@ -555,7 +570,7 @@ ipcMain.handle('copilot:probe-background', async (_event, shellIds) => {
   }
 })
 
-ipcMain.handle('copilot:refresh-quota', async () => {
+registerIpcHandle('copilot:refresh-quota', async () => {
   try {
     const copilot = await getClient()
     return { ok: true, quota: await getQuota(copilot) }
@@ -564,7 +579,7 @@ ipcMain.handle('copilot:refresh-quota', async () => {
   }
 })
 
-ipcMain.handle('copilot:create-session', async (_event, options = {}) => {
+registerIpcHandle('copilot:create-session', async (_event, options = {}) => {
   try {
     let workingDirectory = typeof options.workingDirectory === 'string' ? options.workingDirectory : ''
     if (options.chooseFolder) {
@@ -611,7 +626,7 @@ ipcMain.handle('copilot:create-session', async (_event, options = {}) => {
 // A payload that is missing or null is unpacked inside the handler, not in the parameter list.
 // Destructuring in the parameter list runs before the body, so the try below cannot catch it and
 // the renderer gets a raw rejection instead of the refusal every other failure returns.
-ipcMain.handle('copilot:fork-session', async (_event, payload) => {
+registerIpcHandle('copilot:fork-session', async (_event, payload) => {
   try {
     const { sessionId, name } = payload || {}
     const copilot = await getClient()
@@ -641,7 +656,7 @@ ipcMain.handle('copilot:fork-session', async (_event, payload) => {
   }
 })
 
-ipcMain.handle('copilot:open-session', async (_event, sessionId) => {
+registerIpcHandle('copilot:open-session', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
     const events = await session.getEvents()
@@ -652,7 +667,7 @@ ipcMain.handle('copilot:open-session', async (_event, sessionId) => {
   }
 })
 
-ipcMain.handle('copilot:send-message', async (_event, payload) => {
+registerIpcHandle('copilot:send-message', async (_event, payload) => {
   try {
     const { sessionId, prompt, attachments } = payload || {}
     const session = await resumeSession(sessionId)
@@ -687,7 +702,7 @@ ipcMain.handle('copilot:send-message', async (_event, payload) => {
 // on a long turn is most of the time it is running. What actually settles it is whether a turn
 // was left open: work is under way while the assistant has started a turn it has not closed, or
 // while the last thing on record is the user asking for something.
-ipcMain.handle('copilot:session-busy', async (_event, sessionId) => {
+registerIpcHandle('copilot:session-busy', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
     const types = (await session.getEvents()).map((event) => event.type)
@@ -702,7 +717,7 @@ ipcMain.handle('copilot:session-busy', async (_event, sessionId) => {
   }
 })
 
-ipcMain.handle('copilot:read-todos', async (_event, sessionId) => {
+registerIpcHandle('copilot:read-todos', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
     // The plain read, not the one that also returns dependency edges. The panel answers
@@ -730,7 +745,7 @@ ipcMain.handle('copilot:read-todos', async (_event, sessionId) => {
 // event log, where each one carries the shell id that the log probe needs to report progress.
 // Taking them from here as well would list every background command twice and strip the copy
 // that can show a percentage.
-ipcMain.handle('copilot:list-tasks', async (_event, sessionId) => {
+registerIpcHandle('copilot:list-tasks', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
     const list = await session.rpc.tasks.list()
@@ -765,7 +780,7 @@ ipcMain.handle('copilot:list-tasks', async (_event, sessionId) => {
 
 // Slash commands come straight from the runtime, so the palette lists exactly what this
 // session can run: built-ins plus every discovered skill.
-ipcMain.handle('copilot:list-commands', async (_event, sessionId) => {
+registerIpcHandle('copilot:list-commands', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
     const list = await session.rpc.commands.list({
@@ -792,7 +807,7 @@ ipcMain.handle('copilot:list-commands', async (_event, sessionId) => {
 
 // Invoking returns one of several shapes. Only two matter to this UI: text to print, or a
 // prompt to hand to the agent. Everything else is reported as handled with no output.
-ipcMain.handle('copilot:invoke-command', async (_event, payload) => {
+registerIpcHandle('copilot:invoke-command', async (_event, payload) => {
   try {
     const { sessionId, name, input } = payload || {}
     const session = await resumeSession(sessionId)
@@ -827,7 +842,7 @@ ipcMain.handle('copilot:invoke-command', async (_event, payload) => {
   }
 })
 
-ipcMain.handle('copilot:abort-session', async (_event, sessionId) => {  try {
+registerIpcHandle('copilot:abort-session', async (_event, sessionId) => {  try {
     const active = activeSessions.get(sessionId)
     if (!active) return { ok: false, error: { message: 'Session is not running.' } }
     await active.session.abort()
@@ -837,7 +852,7 @@ ipcMain.handle('copilot:abort-session', async (_event, sessionId) => {  try {
   }
 })
 
-ipcMain.handle('copilot:pick-attachments', async () => {
+registerIpcHandle('copilot:pick-attachments', async () => {
   try {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: 'Attach files',
@@ -857,7 +872,7 @@ ipcMain.handle('copilot:pick-attachments', async () => {
   }
 })
 
-ipcMain.handle('copilot:save-pasted-image', async (_event, payload = {}) => {
+registerIpcHandle('copilot:save-pasted-image', async (_event, payload = {}) => {
   try {
     const data = payload?.data
     if (!data) return { ok: false, error: { message: 'The clipboard did not contain an image.' } }
@@ -885,7 +900,7 @@ ipcMain.handle('copilot:save-pasted-image', async (_event, payload = {}) => {
   }
 })
 
-ipcMain.handle('copilot:read-attachment-preview', async (_event, filePath) => {
+registerIpcHandle('copilot:read-attachment-preview', async (_event, filePath) => {
   try {
     if (typeof filePath !== 'string' || !filePath) {
       return { ok: false, error: { message: 'No attachment path was provided.' } }
@@ -904,7 +919,7 @@ ipcMain.handle('copilot:read-attachment-preview', async (_event, filePath) => {
   }
 })
 
-ipcMain.handle('copilot:set-model', async (_event, payload) => {
+registerIpcHandle('copilot:set-model', async (_event, payload) => {
   try {
     const { sessionId, model } = payload || {}
     const session = await resumeSession(sessionId)
@@ -915,7 +930,7 @@ ipcMain.handle('copilot:set-model', async (_event, payload) => {
   }
 })
 
-ipcMain.handle('copilot:delete-session', async (_event, sessionId) => {
+registerIpcHandle('copilot:delete-session', async (_event, sessionId) => {
   if (!sessionId) return { ok: false, error: { message: 'No chat was given to delete.' } }
   if (deletingSessions.has(sessionId)) {
     return { ok: false, error: { message: 'This chat is already being deleted.' } }
@@ -949,7 +964,7 @@ ipcMain.handle('copilot:delete-session', async (_event, sessionId) => {
   }
 })
 
-ipcMain.handle('app:open-external', async (_event, url) => {
+registerIpcHandle('app:open-external', async (_event, url) => {
   // Every failure used to come back as a bare false, so a link that did nothing gave neither
   // the user nor the log any idea why.
   try {
@@ -971,6 +986,14 @@ ipcMain.handle('app:open-external', async (_event, url) => {
 // the transcript it came from still holds the content.
 const PREVIEW_KEEP_MS = 24 * 60 * 60 * 1000
 
+function registerIpcHandle(channel, handler) {
+  registerSecureIpcHandle(ipcMain, channel, handler, () => mainWindow, () => ({
+    isDev,
+    devOrigin: DEV_ORIGIN,
+    packagedEntryFile: PACKAGED_ENTRY_FILE,
+  }))
+}
+
 async function prunePreviews() {
   try {
     const names = await readdir(PREVIEWS_DIRECTORY)
@@ -985,7 +1008,7 @@ async function prunePreviews() {
   } catch { /* nothing written yet, or temp is unreadable: neither is worth reporting */ }
 }
 
-ipcMain.handle('preview:open-in-browser', async (_event, html) => {
+registerIpcHandle('preview:open-in-browser', async (_event, html) => {
   try {
     if (typeof html !== 'string' || !html.trim()) {
       return { ok: false, error: { message: 'There is nothing to preview.' } }
@@ -1002,7 +1025,7 @@ ipcMain.handle('preview:open-in-browser', async (_event, html) => {
   }
 })
 
-ipcMain.handle('preview:save-html', async (_event, payload) => {
+registerIpcHandle('preview:save-html', async (_event, payload) => {
   try {
     const { html, suggestedName } = payload || {}
     if (typeof html !== 'string' || !html.trim()) {
@@ -1021,7 +1044,7 @@ ipcMain.handle('preview:save-html', async (_event, payload) => {
   }
 })
 
-ipcMain.handle('app:open-path', async (_event, targetPath) => {
+registerIpcHandle('app:open-path', async (_event, targetPath) => {
   try {
     if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) return { ok: false }
     const error = await shell.openPath(targetPath)
@@ -1032,7 +1055,7 @@ ipcMain.handle('app:open-path', async (_event, targetPath) => {
   }
 })
 
-ipcMain.handle('app:reveal-path', async (_event, targetPath) => {
+registerIpcHandle('app:reveal-path', async (_event, targetPath) => {
   try {
     if (typeof targetPath !== 'string' || !targetPath.startsWith('/')) return { ok: false }
     shell.showItemInFolder(targetPath)
@@ -1045,6 +1068,11 @@ ipcMain.handle('app:reveal-path', async (_event, targetPath) => {
 // This one is a listener, not a request, so a bad payload would throw on the main process event
 // stack with nobody to catch it rather than coming back as a refusal.
 ipcMain.on('copilot:permission-answer', (_event, payload) => {
+  if (!isTrustedRendererEvent(_event, mainWindow, {
+    isDev,
+    devOrigin: DEV_ORIGIN,
+    packagedEntryFile: PACKAGED_ENTRY_FILE,
+  })) return
   const { requestId, approved, forSession } = payload || {}
   const pending = pendingPermissions.get(requestId)
   if (!pending) return
@@ -1191,22 +1219,25 @@ async function buildWindow() {
   // Copilot session. Nothing in this app should ever navigate away from its own page, so any
   // attempt to is refused rather than handed that bridge. Links go to the real browser, which
   // has no such powers.
-  const isOwnPage = (target) => {
-    try {
-      const url = new URL(target)
-      if (isDev) return url.origin === 'http://127.0.0.1:5173'
-      return url.protocol === 'file:'
-    } catch {
-      return false
-    }
-  }
-
-  mainWindow.webContents.on('will-navigate', (navigationEvent, url) => {
-    if (isOwnPage(url)) return
+  const blockUntrustedNavigation = (navigationEvent, url) => {
+    if (isOwnAppPage(url, {
+      isDev,
+      devOrigin: DEV_ORIGIN,
+      packagedEntryFile: PACKAGED_ENTRY_FILE,
+    })) return
     navigationEvent.preventDefault()
     appendLog(`blocked navigation to ${url}`)
-    if (/^https?:$/.test(new URL(url).protocol)) shell.openExternal(url).catch(() => {})
-  })
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        shell.openExternal(parsed.toString()).catch(() => {})
+      }
+    } catch {
+      // Invalid navigation targets are simply blocked.
+    }
+  }
+  mainWindow.webContents.on('will-navigate', blockUntrustedNavigation)
+  mainWindow.webContents.on('will-redirect', blockUntrustedNavigation)
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//.test(url)) shell.openExternal(url).catch(() => {})

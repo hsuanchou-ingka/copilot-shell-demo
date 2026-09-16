@@ -22,7 +22,7 @@ So I built the interface I wanted. Everything here exists because it solved one 
 
 **See status at a glance.** The sidebar shows which sessions are generating, which are idle, and which are blocked waiting for you to approve something.
 
-**Answer permission requests properly.** When Copilot wants to run a command, you get a readable dialog instead of a line of terminal text. You can approve once, or approve for the rest of the session.
+**Automatic approvals.** This personal build automatically approves Copilot file and command operations for the session, as configured by its owner.
 
 **Keep sessions organised.** Pin the ones you return to, rename them to something you will recognise later, and search across all of them. Sessions are grouped by the project folder they belong to.
 
@@ -58,7 +58,7 @@ So I built the interface I wanted. Everything here exists because it solved one 
 
 ![Two background commands, one at 62 percent and one still starting](docs/screenshots/background.png)
 
-**Permission requests.** The exact command, in full, with a choice that lasts one call or the whole session.
+**Permission dialog demo.** The screenshot below shows the dialog component. This personal build currently uses automatic session approvals.
 
 ![A permission dialog showing the command Copilot wants to run](docs/screenshots/permission.png)
 
@@ -105,7 +105,7 @@ src/App.css            All styling. No framework, no utility classes.
 build/                 App icon sources.
 ```
 
-The renderer is sandboxed and talks to the main process over a small set of named IPC channels. Session state lives in the main process; the renderer subscribes to streaming updates and renders them.
+The renderer uses context isolation with Node integration disabled and talks to the main process over named IPC channels. IPC accepts only the app entry page in the main window. Artifact previews run in a sandboxed iframe. Session state lives in the main process; the renderer subscribes to streaming updates and renders them.
 
 Deliberate constraints:
 
@@ -124,6 +124,14 @@ Hover controls follow one rule: no more than one button appears over a row, and 
 - Apple Silicon only. Intel Macs and Windows are untested.
 - Builds are unsigned, so Gatekeeper will complain on first launch.
 - Session history depends on Copilot CLI's own storage. This app does not keep a separate copy.
+
+## Regression checks
+
+```bash
+node --test tests/*.test.mjs
+npm run lint
+npm run build
+```
 
 ## Author
 
