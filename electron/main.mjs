@@ -287,7 +287,13 @@ async function refreshSessionMetadata(sessionId) {
 }
 
 function attachSession(session) {
-  if (activeSessions.has(session.sessionId)) return session
+  const existing = activeSessions.get(session.sessionId)
+  // Same handle, already wired up.
+  if (existing?.session === session) return session
+  // A different handle for the same id means the runtime has just made this one authoritative
+  // and stopped delivering events to the old one. Returning early here would leave us
+  // subscribed to a handle that has gone quiet, so the old subscription is dropped instead.
+  if (existing) existing.unsubscribe()
 
   const unsubscribe = session.on((event) => {
     sendToRenderer('copilot:event', {
@@ -836,9 +842,14 @@ ipcMain.handle('copilot:delete-session', async (_event, sessionId) => {
   try {
     const active = activeSessions.get(sessionId)
     if (active) {
-      active.unsubscribe()
-      await active.session.disconnect()
+      // Drop it from the map before tearing it down. A disconnect that throws used to leave an
+      // unsubscribed entry behind, which both stopped forwarding events and made the map claim
+      // the session was still live, so the delete could never succeed on a retry either.
       activeSessions.delete(sessionId)
+      active.unsubscribe()
+      await active.session.disconnect().catch((error) => {
+        appendLog(`disconnect failed while deleting ${sessionId}: ${error?.message || String(error)}`)
+      })
     }
     rejectPendingPermissionsForSession(sessionId)
     const copilot = await getClient()

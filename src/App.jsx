@@ -570,7 +570,9 @@ const TURN_END_EVENTS = new Set([
   'session.idle',
 ])
 // That burst has to produce one ending rather than four, or a queued message would be sent once
-// per signal. Genuine turns are seconds apart, so collapsing a second of them is safe.
+// per signal and the whole queue would empty in a few milliseconds. Genuine turns are seconds
+// apart, so collapsing a second of them is safe, and the window also heals itself: nothing
+// needs to reset it for the next turn's ending to land, it just has to be a second later.
 const TURN_END_WINDOW_MS = 1000
 // A turn that has gone this long without producing a single event is not something to keep
 // showing a confident spinner for.
@@ -1388,6 +1390,9 @@ function App() {
   // When each session last produced any event, and when its turn was last declared over.
   const lastEventAtRef = useRef({})
   const turnEndedAtRef = useRef({})
+  // Counts messages actually handed to the runtime, so a queue that empties can be told apart:
+  // the runtime took it, or the user deleted it. Those need opposite handling.
+  const deliveryCountRef = useRef({})
 
   const [resourceEdits, setResourceEdits] = useState(() => loadValue(RESOURCES_KEY, {}) || {})
   const [railOpen, setRailOpen] = useState(false)
@@ -2382,7 +2387,7 @@ function App() {
     const optimisticId = `local-${crypto.randomUUID()}`
     patchSessionState(sessionId, { working: true })
     lastEventAtRef.current[sessionId] = Date.now()
-    turnEndedAtRef.current[sessionId] = 0
+    deliveryCountRef.current[sessionId] = (deliveryCountRef.current[sessionId] || 0) + 1
     if (selectedIdRef.current === sessionId) {
       setMessages((items) => [...items, {
         id: optimisticId,
@@ -2550,8 +2555,13 @@ function App() {
       showError(result?.error?.message || `Could not run /${known.name}.`)
       return true
     }
-    // A prompt result already started an agent turn, so the normal event stream takes over.
-    if (result.outcome === 'prompt') return true
+    // A prompt result already started an agent turn, so the normal event stream takes over. It
+    // still counts as the start of a turn, otherwise the stall warning would measure from
+    // whenever the previous turn last spoke and announce a stall that has not happened.
+    if (result.outcome === 'prompt') {
+      lastEventAtRef.current[sessionId] = Date.now()
+      return true
+    }
 
     patchSessionState(sessionId, { working: false })
     if (result.outcome === 'text' && result.text) {
@@ -2633,6 +2643,7 @@ function App() {
     const sessionId = selectedId
     // Remember what was at the front so the fallback below can tell whether it was picked up.
     const waitingId = queuesRef.current[sessionId]?.[0]?.id || null
+    const deliveriesBefore = deliveryCountRef.current[sessionId] || 0
 
     const result = await api.abortSession(sessionId)
     if (!result.ok) {
@@ -2654,8 +2665,16 @@ function App() {
     // normal path a moment, then send it directly. Nothing is sent twice: if the queue moved,
     // the runtime already took it.
     window.setTimeout(() => {
-      if (queuesRef.current[sessionId]?.[0]?.id !== waitingId) return
-      drainQueueRef.current(sessionId)
+      if ((deliveryCountRef.current[sessionId] || 0) > deliveriesBefore) return
+      if (queuesRef.current[sessionId]?.[0]?.id === waitingId) {
+        drainQueueRef.current(sessionId)
+        return
+      }
+      // Nothing was sent and the message is gone, so it was deleted by hand. There is no turn
+      // left to wait for, and the composer must not be left insisting it is working.
+      if (!drainQueueRef.current(sessionId)) {
+        patchSessionState(sessionId, { working: false })
+      }
     }, 1500)
   }
 
@@ -2713,7 +2732,11 @@ function App() {
       delete draftsRef.current[id]
       delete lastEventAtRef.current[id]
       delete turnEndedAtRef.current[id]
+      delete deliveryCountRef.current[id]
       writeQueue(id, [])
+      // Without this the draft effect still thinks it is leaving this session on the next
+      // render and saves an empty draft back under an id that no longer exists.
+      if (draftSessionIdRef.current === id) draftSessionIdRef.current = null
     })
     if (gone.has(selectedIdRef.current)) {
       const stillMine = remaining.filter((session) => isOwnedSession(session.id))
