@@ -2512,15 +2512,39 @@ function App() {
     deliverMessage(selectedId, KEEP_WORKING_PROMPT, [])
   }
 
+  // Stopping means "that turn was going nowhere", and when a message is already waiting it also
+  // means "this one is the point". So the queue survives: aborting ends the turn, the runtime
+  // reports idle, and the normal idle handler sends whatever is queued. Throwing the queue away
+  // here used to discard the very message the stop was meant to prioritise.
   const stopSession = async () => {
     if (!selectedId) return
-    const result = await api.abortSession(selectedId)
+    const sessionId = selectedId
+    // Remember what was at the front so the fallback below can tell whether it was picked up.
+    const waitingId = queuesRef.current[sessionId]?.[0]?.id || null
+
+    const result = await api.abortSession(sessionId)
     if (!result.ok) {
       showError(result.error?.message || 'Could not stop this session.')
       return
     }
-    writeQueue(selectedId, [])
-    patchSessionState(selectedId, { working: false, liveText: '', toolActivity: [], backgroundAgents: [] })
+
+    // Background shells and agents are detached from the turn and keep running after it ends,
+    // so they stay listed here exactly as they do on a normal idle. Their own liveness checks
+    // drop them when they actually finish.
+    patchSessionState(sessionId, { liveText: '', toolActivity: [] })
+    if (!waitingId) {
+      patchSessionState(sessionId, { working: false })
+      return
+    }
+
+    // A wedged session is the reason people reach for stop in the first place, and one that
+    // never reports idle would leave the message waiting for a turn that never ends. Give the
+    // normal path a moment, then send it directly. Nothing is sent twice: if the queue moved,
+    // the runtime already took it.
+    window.setTimeout(() => {
+      if (queuesRef.current[sessionId]?.[0]?.id !== waitingId) return
+      drainQueueRef.current(sessionId)
+    }, 1500)
   }
 
   const forkSession = async (session) => {
@@ -3591,8 +3615,15 @@ function App() {
               </div>
               <div className="composer-send-group">
                 {working && (
-                  <button className="stop" onClick={stopSession} title="Stop" aria-label="Stop">
-                    <Square size={12} /> Stop
+                  <button
+                    className="stop"
+                    onClick={stopSession}
+                    title={selectedQueue.length
+                      ? 'End this turn and send the next queued message'
+                      : 'End this turn'}
+                    aria-label={selectedQueue.length ? 'Stop and send next' : 'Stop'}
+                  >
+                    <Square size={12} /> {selectedQueue.length ? 'Stop and send next' : 'Stop'}
                   </button>
                 )}
                 {messages.length > 0 && (
