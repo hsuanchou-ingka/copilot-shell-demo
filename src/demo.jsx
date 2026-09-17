@@ -1,15 +1,40 @@
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
+import DemoTour from './demo-tour.jsx'
 
 // A standalone harness that renders the real interface against fabricated data.
-// It exists so the screenshots in the README never contain anything from a real
-// account. Pick a state with ?scene= and capture the page.
+// It backs both the README screenshots and the public web demo on GitHub Pages.
+// Pick a state with ?scene=. Add ?shot=1 to get the fixed 1420x920 window the
+// screenshots are captured from; without it the window scales to fit the browser.
 
 const WORKSPACE = '/Users/demo/work'
 const SESSION_ID = 's1'
 
-const scene = new URLSearchParams(window.location.search).get('scene') || 'overview'
+const params = new URLSearchParams(window.location.search)
+const SHOT = params.get('shot') === '1'
+const requestedScene = params.get('scene')
+// The public demo has no ?scene= in its URL, so it defaults to a state that shows
+// the sidebar, the conversation, the plan panel and a queued message all at once.
+// Screenshot capturing always passes an explicit scene, so its old default of
+// "overview" is kept for that case.
+const scene = requestedScene || (SHOT ? 'overview' : 'tour')
+
+document.body.classList.add(SHOT ? 'shot' : 'web')
+
+if (!SHOT) {
+  const STAGE_WIDTH = 1420
+  const STAGE_HEIGHT = 920
+  const VIEWPORT_MARGIN = 24
+  function fitStage() {
+    const availableWidth = window.innerWidth - VIEWPORT_MARGIN * 2
+    const availableHeight = window.innerHeight - VIEWPORT_MARGIN * 2
+    const scaleToFit = Math.min(availableWidth / STAGE_WIDTH, availableHeight / STAGE_HEIGHT)
+    document.documentElement.style.setProperty('--stage-scale', String(Math.max(scaleToFit, 0.2)))
+  }
+  fitStage()
+  window.addEventListener('resize', fitStage)
+}
 
 function iso(minutesAgo) {
   return new Date(Date.now() - minutesAgo * 60_000).toISOString()
@@ -69,7 +94,7 @@ window.copilot = {
     auth: { login: 'demo-user' },
     models: MODELS,
     sessions: SESSIONS,
-    quota: { premium_interactions: { usedRequests: 18420, entitlementRequests: 70000, remainingPercentage: 73.7 } },
+    quota: { premium_interactions: { usedRequests: 18420, entitlementRequests: 50000, remainingPercentage: 63.2 } },
     capabilities: {
       mcp: ['figma', 'notion', 'playwright', 'filesystem'],
       agents: ['explore', 'worker', 'reviewer', 'errand'],
@@ -299,6 +324,18 @@ const SCENES = {
     }, 200)
   },
 
+  // The state the public web demo opens on: a plan in progress, a reply already in
+  // the conversation, and a second message left typed in the composer, so every
+  // region the guided tour points at has something in it from the start.
+  tour() {
+    SCENES.plan()
+    const box = document.querySelector('.composer textarea')
+    if (!box) return
+    typeInto(box, 'Then update the changelog entry for 4.2')
+    pressEnter(box)
+    typeInto(box, 'And check whether any component still hardcodes the old grey')
+  },
+
   background() {
     emit({
       type: 'tool.execution_start',
@@ -352,3 +389,13 @@ whenReady(() => {
     console.error('scene failed', error)
   }
 })
+
+if (!SHOT) {
+  // The tour is mounted on its own root outside #stage, so its fixed position
+  // elements are measured in real viewport coordinates rather than being caught
+  // by the CSS transform that scales the stage to fit the window.
+  const tourHost = document.createElement('div')
+  tourHost.id = 'demo-tour-host'
+  document.body.appendChild(tourHost)
+  createRoot(tourHost).render(<DemoTour />)
+}

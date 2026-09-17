@@ -183,8 +183,21 @@ function serializeError(error) {
   }
 }
 
+async function resolveActiveLogin(candidate) {
+  try {
+    const { stdout } = await execFileAsync(
+      candidate,
+      ['api', 'user', '-q', '.login'],
+      { timeout: 10000 },
+    )
+    return stdout.trim() || null
+  } catch {
+    return null
+  }
+}
+
 async function getGitHubToken() {
-  const preferredLogin = 'hsuanchou-ingka'
+  const preferredLogin = process.env.HC_COPILOT_GH_USER || 'hsuanchou-ingka'
   const candidates = [
     process.env.GH_PATH,
     '/opt/homebrew/bin/gh',
@@ -201,7 +214,31 @@ async function getGitHubToken() {
         { timeout: 10000 },
       )
       const token = stdout.trim()
-      if (token) return { token, login: preferredLogin }
+      if (token) {
+        appendLog(`github token resolved for preferred login ${preferredLogin}`)
+        return { token, login: preferredLogin }
+      }
+    } catch {
+      // Try the next common GitHub CLI location.
+    }
+  }
+
+  // The preferred login was not usable on any gh path. Fall back to whatever account
+  // is currently active in the CLI, which is what colleagues without that login have.
+  for (const candidate of candidates) {
+    if (candidate.includes('/') && !existsSync(candidate)) continue
+    try {
+      const { stdout } = await execFileAsync(
+        candidate,
+        ['auth', 'token', '--hostname', 'github.com'],
+        { timeout: 10000 },
+      )
+      const token = stdout.trim()
+      if (token) {
+        const login = await resolveActiveLogin(candidate)
+        appendLog(`github token resolved for active login ${login || 'unknown'}`)
+        return { token, login }
+      }
     } catch {
       // Try the next common GitHub CLI location.
     }

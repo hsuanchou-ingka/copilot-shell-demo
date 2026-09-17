@@ -9,8 +9,10 @@
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "vite build",
+    "build:demo": "vite build --config vite.demo.config.js && mv dist-demo/demo.html dist-demo/index.html",
     "lint": "oxlint",
     "preview": "vite preview",
+    "test": "node --test tests/*.test.mjs",
     "app": "npm run build && electron .",
     "dist:mac": "npm run build && electron-builder --mac"
   },

@@ -1,0 +1,123 @@
+/* Styling for the guided tour shown only inside the public web demo. Colours and
+   radii match src/App.css so the tour reads as part of the product, not a bolted on
+   widget. */
+
+.demo-tour-spotlight {
+  position: fixed;
+  z-index: 9998;
+  border-radius: 12px;
+  box-shadow: 0 0 0 9999px rgba(28, 27, 25, .55);
+  pointer-events: none;
+  transition: top .2s ease, left .2s ease, width .2s ease, height .2s ease;
+}
+
+.demo-tour-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 9997;
+  background: rgba(28, 27, 25, .45);
+  pointer-events: none;
+}
+
+.demo-tour-card {
+  position: fixed;
+  z-index: 9999;
+  width: 300px;
+  max-width: 320px;
+  background: #fff;
+  border: 1px solid #e1dfda;
+  border-radius: 12px;
+  box-shadow: 0 10px 28px rgba(48, 47, 43, .2);
+  padding: 16px;
+  color: #2f2e2a;
+  font-size: 13px;
+  line-height: 1.5;
+  transition: top .2s ease, left .2s ease;
+}
+
+.demo-tour-card.centered {
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.demo-tour-step {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: .02em;
+  color: #75716a;
+}
+
+.demo-tour-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.demo-tour-body {
+  margin: 0 0 14px;
+  color: #4a4842;
+}
+
+.demo-tour-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.demo-tour-skip {
+  margin-right: auto;
+  border: none;
+  background: none;
+  padding: 4px 2px;
+  font-size: 12px;
+  color: #75716a;
+  cursor: pointer;
+}
+
+.demo-tour-skip:hover {
+  color: #2f2e2a;
+}
+
+.demo-tour-next,
+.demo-tour-install {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid #3d3b36;
+  background: #3d3b36;
+  color: #fff;
+  font-size: 12px;
+  line-height: 28px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.demo-tour-pill {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 9997;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid #d5d2cb;
+  background: #fff;
+  color: #4a4842;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(48, 47, 43, .14);
+}
+
+.demo-tour-pill:hover {
+  border-color: #bdb9b0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .demo-tour-spotlight,
+  .demo-tour-card {
+    transition: none;
+  }
+}

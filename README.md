@@ -2,7 +2,7 @@
 
 A desktop client for GitHub Copilot CLI, built for people who run more than one conversation at a time.
 
-Copilot CLI is excellent, but it gives you one conversation in one terminal tab. When you are researching in one thread, refactoring in another, and waiting on a long build in a third, tabs stop being a good way to hold that. This app keeps every session in one window, shows you which ones are working and which ones are waiting on you, and lets you move between them without losing your place.
+**[Try the live demo](https://hsuanchou-ingka.github.io/copilot-shell-demo/)**, made up data, runs in your browser, includes a short tour.
 
 ![Sessions grouped by project, with the conversation open beside them](docs/screenshots/overview.png)
 
@@ -62,15 +62,24 @@ So I built the interface I wanted. Everything here exists because it solved one 
 
 ![A permission dialog showing the command Copilot wants to run](docs/screenshots/permission.png)
 
-## Requirements
+## Install
 
-- macOS on Apple Silicon
-- Node.js 20 or newer
-- GitHub Copilot CLI, authenticated and working in your terminal
+You need macOS on Apple Silicon, and the GitHub CLI (`gh`) installed and logged in with a GitHub account that has Copilot access. The app talks to Copilot through a bundled SDK, no separate Copilot CLI install needed.
 
-If `copilot` runs in your terminal, this app will run.
+1. Install `gh`, then run `gh auth login` and sign in.
+2. Download the zip from the [Releases page](https://github.com/hsuanchou-ingka/copilot-shell-demo/releases/latest).
+3. Unzip it, then drag `HC Copilot.app` into Applications.
+4. The build is unsigned, so run this once in Terminal: `xattr -cr "/Applications/HC Copilot.app"`
+5. Open HC Copilot from Applications.
 
-## Getting started
+**Troubleshooting**
+
+- **App is damaged or cannot be opened:** re-run the `xattr` command above against the app in `/Applications`.
+- **GitHub CLI is not logged in:** run `gh auth login`, then reopen the app.
+- **Multiple `gh` accounts:** the app uses the active one. Run `gh auth switch` to pick the account with Copilot access, then reopen the app.
+- Logs are at `~/Library/Application Support/HC Copilot/app.log`.
+
+## Run from source
 
 ```bash
 git clone https://github.com/hsuanchou-ingka/copilot-shell-demo.git
@@ -79,20 +88,14 @@ npm install
 npm run dev
 ```
 
-`npm run dev` starts Vite and Electron together with hot reload.
+`npm run dev` starts Vite and Electron together with hot reload. `npm run dist:mac` builds a `.dmg` and a `.zip` in `release/`. `npm run build:demo` builds the browser demo.
 
-## Building a distributable app
-
-```bash
-npm run dist:mac
-```
-
-This produces a `.dmg` and a `.zip` in `release/`. The build is unsigned, so the first launch needs right click then Open.
-
-To install it into `/Applications`:
+Before sending a change, run the checks:
 
 ```bash
-ditto "release/mac-arm64/HC Copilot.app" "/Applications/HC Copilot.app"
+npm test
+npm run lint
+npm run build
 ```
 
 ## How it is put together
@@ -124,14 +127,6 @@ Hover controls follow one rule: no more than one button appears over a row, and 
 - Apple Silicon only. Intel Macs and Windows are untested.
 - Builds are unsigned, so Gatekeeper will complain on first launch.
 - Session history depends on Copilot CLI's own storage. This app does not keep a separate copy.
-
-## Regression checks
-
-```bash
-node --test tests/*.test.mjs
-npm run lint
-npm run build
-```
 
 ## Author
 

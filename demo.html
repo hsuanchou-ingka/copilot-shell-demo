@@ -5,18 +5,50 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HC Copilot</title>
     <style>
-      html, body { margin: 0; background: transparent; }
-      #root {
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body.shot {
+        background: transparent;
+      }
+
+      /* Web mode gets a calm neutral page background so the scaled window sits on
+         something other than plain white, with room around it on every side. */
+      body.web {
+        background: #ece9e3;
+      }
+
+      #stage {
         width: 1420px;
         height: 920px;
+      }
+
+      /* In web mode the stage is centered and scaled to fit the viewport. The scale
+         factor is written to --stage-scale by src/demo.jsx and recalculated on resize. */
+      body.web #stage {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%) scale(var(--stage-scale, 1));
+        transform-origin: center center;
+      }
+
+      #root {
+        position: relative;
+        width: 100%;
+        height: 100%;
         overflow: hidden;
         border-radius: 10px;
         box-shadow: 0 22px 70px rgba(0, 0, 0, .28), 0 0 0 .5px rgba(0, 0, 0, .16);
       }
+
       /* The traffic lights are drawn by macOS, so the harness paints stand ins. */
       #root::before {
         content: '';
-        position: fixed;
+        position: absolute;
         z-index: 99;
         left: 19px;
         top: 19px;
@@ -31,7 +63,9 @@
     </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="stage">
+      <div id="root"></div>
+    </div>
     <script type="module" src="/src/demo.jsx"></script>
   </body>
 </html>
