@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import './demo-tour.css'
 
 // A short guided tour shown only inside the public web demo, never in the real
-// Electron app. It walks a visitor past the four regions of the interface and then
+// Electron app. It walks a visitor past four parts of the interface and then
 // points at the install instructions. Dismissal is remembered in localStorage so a
 // returning visitor is not shown it again, but a quiet pill lets them restart it.
 
@@ -20,9 +20,9 @@ const STEPS = [
     body: 'The conversation happens here. Answers can render as tables, links and file attachments.',
   },
   {
-    selector: '.plan-hud',
-    title: 'Follow the plan',
-    body: 'See what Copilot is doing right now, one step at a time, instead of guessing from a percentage.',
+    selector: ['.topbar', '.resource-rail'],
+    title: 'Know where you are',
+    body: 'The header shows the project, the model in use and the credits left, with the files, GitHub and Notion this session is connected to just below.',
   },
   {
     selector: '.composer-wrap',
@@ -37,7 +37,7 @@ const STEPS = [
   },
 ]
 
-const REQUIRED_SELECTORS = ['.sidebar', '.conversation', '.plan-hud', '.composer-wrap']
+const REQUIRED_SELECTORS = ['.sidebar', '.conversation', '.topbar', '.composer-wrap']
 
 function readDismissed() {
   try {
@@ -90,8 +90,29 @@ function placeCard(rect) {
   return { top, left }
 }
 
+// Merges the bounding boxes of one or more nodes into a single rectangle, so a
+// step can spotlight a region made of several sibling elements at once.
+function unionRect(selectors) {
+  let top = Infinity
+  let left = Infinity
+  let right = -Infinity
+  let bottom = -Infinity
+  for (const selector of selectors) {
+    const node = document.querySelector(selector)
+    if (!node) continue
+    const box = node.getBoundingClientRect()
+    top = Math.min(top, box.top)
+    left = Math.min(left, box.left)
+    right = Math.max(right, box.right)
+    bottom = Math.max(bottom, box.bottom)
+  }
+  if (right === -Infinity) return null
+  return { top, left, width: right - left, height: bottom - top }
+}
+
 // Tracks the on screen position of the current step's target with a resize aware
-// polling loop, so it stays correct as the stage scale in demo.html changes.
+// polling loop, so it stays correct as the stage scale in demo.html changes. The
+// selector can be a single string or a list, in which case the boxes are merged.
 function useTargetRect(selector) {
   const [rect, setRect] = useState(null)
 
@@ -100,13 +121,13 @@ function useTargetRect(selector) {
       setRect(null)
       return undefined
     }
+    const selectors = Array.isArray(selector) ? selector : [selector]
     let frame = null
     let cancelled = false
     const measure = () => {
       if (cancelled) return
-      const node = document.querySelector(selector)
-      if (node) {
-        const box = node.getBoundingClientRect()
+      const box = unionRect(selectors)
+      if (box) {
         // Keep the previous object when nothing moved, so the loop does not force
         // a render on every frame.
         setRect((previous) => (
