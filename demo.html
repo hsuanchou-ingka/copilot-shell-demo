@@ -7,8 +7,6 @@
     <style>
       html, body {
         margin: 0;
-        height: 100%;
-        overflow: hidden;
       }
 
       body.shot {
@@ -18,6 +16,8 @@
       /* Web mode gets a calm neutral page background so the scaled window sits on
          something other than plain white, with room around it on every side. */
       body.web {
+        height: 100vh;
+        overflow: hidden;
         background: #ece9e3;
       }
 
@@ -43,6 +43,12 @@
         overflow: hidden;
         border-radius: 10px;
         box-shadow: 0 22px 70px rgba(0, 0, 0, .28), 0 0 0 .5px rgba(0, 0, 0, .16);
+      }
+
+      /* The app sizes itself to the viewport, which is only right inside Electron.
+         Here it has to fill the fixed stage instead, whatever the browser height. */
+      #root .app-shell {
+        height: 100%;
       }
 
       /* The traffic lights are drawn by macOS, so the harness paints stand ins. */
