@@ -83,18 +83,36 @@ You need macOS on Apple Silicon, and the GitHub CLI (`gh`) installed and logged 
 
 ## Browser connection
 
-This is an optional local integration for Copilot CLI and HC Copilot's Copilot runtime, not a built-in browser in the app. Ordinary Playwright MCP starts a separate browser profile; extension mode connects to your existing Chrome or Edge profile.
+Sometimes the thing you want help with is already open in your browser: a page you are reading, a prototype you are reviewing, or a form you need to fill in. Rather than copying everything into the chat or signing in again in a separate browser, you can connect HC Copilot to that tab and tell it what to do.
 
-1. Install Node.js with `npx`, then install the official [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) in the browser profile you want to use.
-2. Get this repository using the source instructions below. Copy the launcher into your local Copilot directory:
+The connection uses Microsoft's official **Playwright Extension**, a Chrome or Edge browser extension, plus a local Playwright MCP server that exposes browser tools to Copilot. It can read page content, follow links, and fill forms using that browser profile's existing login state. This is an optional integration for the desktop app and Copilot CLI, not a built-in browser or a feature of the web demo. Ordinary Playwright MCP opens a separate browser profile; this setup uses extension mode to connect to your existing browser.
+
+### Install the browser extension
+
+1. Open Chrome or Edge in the profile you normally use for the pages you want Copilot to work with.
+2. Open the official [Playwright Extension page](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm).
+3. Click **Add to Chrome** (or the equivalent install button in Edge), review the requested permissions, then confirm **Add extension**.
+4. Open the browser's Extensions menu, select **Playwright Extension**, and open its status page. Keep it available for the connection setup below.
+
+Installing the extension alone is not enough. Copilot also needs the local MCP server configuration below.
+
+### Connect it to HC Copilot or Copilot CLI
+
+**Requirements:** macOS, Node.js with `npx`, and the extension installed in your intended browser profile. If Node.js is not installed, get the LTS installer from [nodejs.org](https://nodejs.org/en/download), then confirm `node --version` and `npx --version` work in Terminal.
+
+**1. Install the launcher.** Open Terminal, get this repository, and copy its launcher into your local Copilot directory. If you already have the repository, run the commands starting with `mkdir` from its root folder instead:
 
 ```bash
+git clone https://github.com/hsuanchou-ingka/copilot-shell-demo.git
+cd copilot-shell-demo
 mkdir -p ~/.copilot/bin
 cp scripts/playwright-mcp.sh ~/.copilot/bin/playwright-mcp
 chmod 700 ~/.copilot/bin/playwright-mcp
 ```
 
-3. Open the extension's status page and copy its `PLAYWRIGHT_MCP_EXTENSION_TOKEN` value. Run the command below, then enter only the token at the password prompt. Do not put it in a command, chat, or committed file:
+You do not need to build the app from source to install this launcher.
+
+**2. Save your connection token securely.** In the extension's status page, copy the value shown for `PLAYWRIGHT_MCP_EXTENSION_TOKEN`. Run the command below, then enter only that value at the password prompt, without the `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` prefix. Terminal may not display characters while you enter it. Do not paste the token into a chat, configuration file, or GitHub:
 
 ```bash
 security add-generic-password -U \
@@ -102,7 +120,7 @@ security add-generic-password -U \
   -a "PLAYWRIGHT_MCP_EXTENSION_TOKEN" -w
 ```
 
-4. Merge this server entry into `~/.copilot/mcp-config.json`, preserving any other servers. Replace the command path with your own absolute home directory:
+**3. Register the browser tools.** Open `~/.copilot/mcp-config.json` in a text editor, creating it if it does not exist. Merge this server entry into its `mcpServers` object, preserving any other servers. If a `playwright` entry already exists, replace only that entry. Replace `YOUR_USERNAME` with your macOS home folder name; run `echo "$HOME"` in Terminal to find the correct absolute path:
 
 ```json
 {
@@ -117,9 +135,25 @@ security add-generic-password -U \
 }
 ```
 
-5. Restart Copilot CLI or fully quit and reopen HC Copilot so its runtime loads the changed configuration. Allow Keychain access if macOS prompts. On connection, select the intended tab in the extension's connection page. The extension groups accessible tabs by client; move a tab into that client's group to make it available. Separate clients have separate groups, so a CLI test does not grant an app session access to the same tabs.
+**4. Reload the connection.** Exit and restart Copilot CLI, or fully quit HC Copilot with **Command + Q** and reopen it. This lets its runtime load the changed configuration. Allow Keychain access if macOS prompts.
 
-Try: "Open a new tab at example.com, read its heading, and follow the Learn more link." To use an existing page, select or add it to the client's group first, then ask the assistant to read it. A successful connection showing only the extension's Welcome page does not mean your ordinary tabs are accessible yet.
+### Use it in a conversation
+
+1. Open the page you want help with in the browser profile where you installed the extension.
+2. In HC Copilot or Copilot CLI, ask: **"Use Playwright to read my existing browser tab and summarise its main points."**
+3. When the extension opens its connection page, select the intended tab. It groups accessible tabs by client; move additional tabs into that client's group if needed. Separate clients have separate groups, so a CLI connection does not automatically expose the same tabs to an app session.
+4. Continue with a specific instruction, such as one of the examples below. You do not need to copy the page content into the chat.
+
+| What you want | Example instruction |
+| --- | --- |
+| Read a page | "Read the page in the connected tab and summarise its main points." |
+| Follow a link | "Find the pricing link on this page and open it." |
+| Fill a form without submitting | "Fill in the fields using the details I provide, but do not submit the form." |
+| Try the connection on a public page | "Open a new tab at example.com, read its heading, and follow the Learn more link." |
+
+A successful connection showing only the extension's **Welcome** page does not mean your ordinary tabs are accessible yet. Select the intended page or add it to the correct client's group before asking Copilot to work with it.
+
+### Privacy and troubleshooting
 
 The launcher retrieves the token from Keychain and passes it only through the MCP process environment. Missing, locked, or empty credentials stop the launcher with an explicit error. This bypasses the extension's connection approval dialog, not the assistant's tool permissions or website confirmations. Browser content exposed to the assistant becomes part of its model context; do not grant access to sensitive pages you do not intend to share. Review actions that submit forms, send messages, or change account settings.
 
