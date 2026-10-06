@@ -30,6 +30,8 @@ So I built the interface I wanted. Everything here exists because it solved one 
 
 **Attach files and images.** Use the file picker, or paste an image straight from the clipboard.
 
+**Work with your existing Chrome tabs.** An optional Playwright MCP connection can read pages, follow links, and fill forms using your browser's existing login state. It requires the official Playwright Extension and local setup; it is not available in the browser demo. The authentication token stays in macOS Keychain rather than the MCP configuration. See [Browser connection](#browser-connection).
+
 **Type ahead while a turn is running.** You do not have to wait for an answer before writing the next message. Anything you send while the session is busy joins a queue and goes out as soon as the turn finishes, in the order you wrote it.
 
 **Find your way back to the things a session touched.** A rail under the header collects the folders, repositories, Notion pages and Figma files that came up in the conversation, and keeps one entry per kind so it stays a shortcut rather than an index. You can rename, hide or add entries by hand.
@@ -78,6 +80,50 @@ You need macOS on Apple Silicon, and the GitHub CLI (`gh`) installed and logged 
 - **GitHub CLI is not logged in:** run `gh auth login`, then reopen the app.
 - **Multiple `gh` accounts:** the app uses the active one. Run `gh auth switch` to pick the account with Copilot access, then reopen the app.
 - Logs are at `~/Library/Application Support/HC Copilot/app.log`.
+
+## Browser connection
+
+This is an optional local integration for Copilot CLI and HC Copilot's Copilot runtime, not a built-in browser in the app. Ordinary Playwright MCP starts a separate browser profile; extension mode connects to your existing Chrome or Edge profile.
+
+1. Install Node.js with `npx`, then install the official [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) in the browser profile you want to use.
+2. Get this repository using the source instructions below. Copy the launcher into your local Copilot directory:
+
+```bash
+mkdir -p ~/.copilot/bin
+cp scripts/playwright-mcp.sh ~/.copilot/bin/playwright-mcp
+chmod 700 ~/.copilot/bin/playwright-mcp
+```
+
+3. Open the extension's status page and copy its `PLAYWRIGHT_MCP_EXTENSION_TOKEN` value. Run the command below, then enter only the token at the password prompt. Do not put it in a command, chat, or committed file:
+
+```bash
+security add-generic-password -U \
+  -s "copilot-playwright-mcp" \
+  -a "PLAYWRIGHT_MCP_EXTENSION_TOKEN" -w
+```
+
+4. Merge this server entry into `~/.copilot/mcp-config.json`, preserving any other servers. Replace the command path with your own absolute home directory:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "local",
+      "command": "/Users/YOUR_USERNAME/.copilot/bin/playwright-mcp",
+      "args": [],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+5. Restart Copilot CLI or fully quit and reopen HC Copilot so its runtime loads the changed configuration. Allow Keychain access if macOS prompts. On connection, select the intended tab in the extension's connection page. The extension groups accessible tabs by client; move a tab into that client's group to make it available. Separate clients have separate groups, so a CLI test does not grant an app session access to the same tabs.
+
+Try: "Open a new tab at example.com, read its heading, and follow the Learn more link." To use an existing page, select or add it to the client's group first, then ask the assistant to read it. A successful connection showing only the extension's Welcome page does not mean your ordinary tabs are accessible yet.
+
+The launcher retrieves the token from Keychain and passes it only through the MCP process environment. Missing, locked, or empty credentials stop the launcher with an explicit error. This bypasses the extension's connection approval dialog, not the assistant's tool permissions or website confirmations. Browser content exposed to the assistant becomes part of its model context; do not grant access to sensitive pages you do not intend to share. Review actions that submit forms, send messages, or change account settings.
+
+**Troubleshooting:** If only Welcome appears, select an ordinary web page in the connection page or add it to the correct client's tab group. If authentication fails, ensure the extension and Keychain token belong to the same Chrome profile; update the Keychain entry if the token changes. The browser demo cannot access your local Keychain or browser tabs.
 
 ## Run from source
 
