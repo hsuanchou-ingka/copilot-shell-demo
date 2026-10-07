@@ -10,6 +10,7 @@ import DemoTour from './demo-tour.jsx'
 
 const WORKSPACE = '/Users/demo/work'
 const SESSION_ID = 's1'
+const DEMO_QUOTA = { premium_interactions: { usedRequests: 18420, entitlementRequests: 50000, remainingPercentage: 63.2 } }
 
 const params = new URLSearchParams(window.location.search)
 const SHOT = params.get('shot') === '1'
@@ -19,6 +20,10 @@ const requestedScene = params.get('scene')
 // Screenshot capturing always passes an explicit scene, so its old default of
 // "overview" is kept for that case.
 const scene = requestedScene || (SHOT ? 'overview' : 'tour')
+// ?stress=1 swaps the fabricated session, folder and model for deliberately long ones, so the
+// header can be reviewed against the content that actually breaks it. Everything else, and the
+// default demo, is untouched.
+const STRESS = params.get('stress') === '1'
 
 document.body.classList.add(SHOT ? 'shot' : 'web')
 
@@ -41,7 +46,18 @@ function iso(minutesAgo) {
 }
 
 const SESSIONS = [
-  { id: SESSION_ID, title: 'Design system tokens', updatedAt: iso(2), context: { workingDirectory: `${WORKSPACE}/design-system` } },
+  {
+    id: SESSION_ID,
+    title: STRESS
+      ? 'Design system token drift across the shared component library and every downstream product surface'
+      : 'Design system tokens',
+    updatedAt: iso(2),
+    context: {
+      workingDirectory: STRESS
+        ? `${WORKSPACE}/platform/design-system/packages/foundations/tokens/colour-semantic-layer`
+        : `${WORKSPACE}/design-system`,
+    },
+  },
   { id: 's2', title: 'Onboarding copy pass', updatedAt: iso(14), context: { workingDirectory: `${WORKSPACE}/onboarding` } },
   { id: 's3', title: 'Release notes 4.2', updatedAt: iso(48), context: { workingDirectory: `${WORKSPACE}/docs` } },
   { id: 's4', title: 'Icon export script', updatedAt: iso(96), context: { workingDirectory: `${WORKSPACE}/design-system` } },
@@ -74,7 +90,11 @@ const EVENTS = [
 ]
 
 const MODELS = [
-  { id: 'claude-opus-5', name: 'Claude Opus 5', billing: { tokenPrices: { inputPrice: 500, outputPrice: 2500 } } },
+  {
+    id: 'claude-opus-5',
+    name: STRESS ? 'Claude Opus 5 Extended Reasoning Preview (October)' : 'Claude Opus 5',
+    billing: { tokenPrices: { inputPrice: 500, outputPrice: 2500 } },
+  },
   { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', billing: { tokenPrices: { inputPrice: 300, outputPrice: 1500 } } },
   { id: 'auto', name: 'Auto', billing: { discountPercent: 10 } },
 ]
@@ -94,7 +114,7 @@ window.copilot = {
     auth: { login: 'demo-user' },
     models: MODELS,
     sessions: SESSIONS,
-    quota: { premium_interactions: { usedRequests: 18420, entitlementRequests: 50000, remainingPercentage: 63.2 } },
+    quota: DEMO_QUOTA,
     capabilities: {
       mcp: ['figma', 'notion', 'playwright', 'filesystem'],
       agents: ['explore', 'worker', 'reviewer', 'errand'],
@@ -107,7 +127,7 @@ window.copilot = {
   listTasks: () => ok({ tasks: mockTasks }),
   readTodos: () => ok({ todos: mockTodos }),
   instructionFiles: () => ok({ files: [{ label: 'AGENTS.md' }, { label: 'Brand guidelines' }, { label: 'Token naming rules' }] }),
-  refreshQuota: () => ok({ quota: null }),
+  refreshQuota: () => ok({ quota: DEMO_QUOTA }),
   probeBackground: () => ok({
     report: {
       icons: { shellId: 'icons', percent: 62, eta: '40s', finished: false, line: '62%|████████  | 124/200 [00:38<00:40, 1.9it/s]' },

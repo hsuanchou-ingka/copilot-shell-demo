@@ -2,8 +2,48 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import vm from 'node:vm'
+import { interruptTurn, prioritizeQueuedMessage } from '../src/turn-interruption.mjs'
 
 const appSource = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
+
+test('Send now stops the current turn and sends the selected queued message once', async () => {
+  const source = sectionBetween('  const stopSession = async', '\n  const forkSession')
+  const queuesRef = { current: { session: [
+    { id: 'first', prompt: 'first', attachments: [] },
+    { id: 'chosen', prompt: 'chosen', attachments: [{ path: 'file.txt' }] },
+  ] } }
+  const stoppingRef = { current: new Set() }
+  const sent = []
+  const errors = []
+  const drainQueueRef = { current: (id) => {
+    if (stoppingRef.current.has(id)) return false
+    const next = queuesRef.current[id].shift()
+    if (next) sent.push(next)
+    return Boolean(next)
+  } }
+  const run = new Function(
+    'selectedId', 'working', 'planTurnIdsRef', 'stoppingRef', 'setStoppingSessions',
+    'interruptTurn', 'api', 'showError', 'turnEndedAtRef', 'finishPlanTurnForSession',
+    'patchSessionState', 'queuesRef', 'writeQueue', 'prioritizeQueuedMessage', 'drainQueueRef',
+    source + '\nreturn stopSession("chosen")',
+  )
+  await run(
+    'session', true, { current: {} }, stoppingRef, () => {},
+    interruptTurn, { abortSession: async (id) => {
+      drainQueueRef.current(id)
+      return { ok: true }
+    } },
+    (message) => errors.push(message), { current: {} }, () => {}, () => {},
+    queuesRef, (id, items) => { queuesRef.current[id] = items },
+    prioritizeQueuedMessage, drainQueueRef,
+  )
+  assert.deepEqual(sent.map((item) => item.id), ['chosen'])
+  assert.deepEqual(sent[0].attachments, [{ path: 'file.txt' }])
+  assert.deepEqual(queuesRef.current.session.map((item) => item.id), ['first'])
+  assert.deepEqual(errors, [])
+  assert.match(appSource, /onClick=\{\(\) => sendQueuedNow\(item.id\)\}/)
+  assert.match(appSource, /onClick=\{\(\) => \{ void stopSession\(\) \}\}/)
+})
 
 function sectionBetween(start, end) {
   const from = appSource.indexOf(start)

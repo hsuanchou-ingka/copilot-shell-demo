@@ -944,54 +944,79 @@ button {
 }
 
 .workspace {
+  container-type: inline-size;
+  container-name: conversation;
   position: relative;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: #fbfaf8;
+  background: #faf9f6;
 }
 
+/* One row that answers three questions in reading order: where am I, which model, how many
+   credits are left. The side tracks are equal, so the model control sits on the centre of the
+   conversation pane itself rather than on whatever is left over beside the title. */
 .topbar {
-  height: 64px;
-  padding: 0 19px;
-  display: flex;
+  padding: 10px 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-areas: "left center right";
+  column-gap: 12px;
+  row-gap: 8px;
+  flex: none;
   align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid #e1dfda;
+  border-bottom: 1px solid #e6e3dc;
+  background: #f7f6f3;
   -webkit-app-region: drag;
 }
 
 .session-title {
-  flex: 1 1 auto;
+  grid-area: left;
+  position: relative;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 6px;
 }
 
 .resource-rail {
   flex: none;
-  border-bottom: 1px solid #e1dfda;
-  background: #faf8f5;
+  border-bottom: 1px solid #ece9e2;
+  background: #faf9f6;
 }
 
 .rail-strip {
-  height: 36px;
-  padding: 0 13px 0 19px;
+  min-height: 36px;
+  padding: 6px 16px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
+.resource-rail.open .rail-strip {
+  align-items: flex-start;
+}
+
+/* Collapsed, the chips are one nowrap row that fades out at the edge. The toggle lives outside
+   this box, so an overflowing row can never push it off the end. */
 .rail-chips {
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
   overflow: hidden;
+  flex-wrap: nowrap;
+  mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+}
+
+.resource-rail.open .rail-chips {
+  flex-wrap: wrap;
+  mask-image: none;
+  -webkit-mask-image: none;
 }
 
 .rail-heading {
@@ -1003,20 +1028,34 @@ button {
 }
 
 .rail-chip {
-  flex: none;
-  height: 23px;
-  padding: 0 4px;
+  flex: 0 0 auto;
+  max-width: 220px;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px 0 4px;
   display: flex;
   align-items: center;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  background: transparent;
+  gap: 5px;
+  border: 1px solid #e3e0d9;
+  border-radius: 6px;
+  background: #fbfaf8;
+  color: #4d4a44;
   cursor: pointer;
+  font-size: 12px;
+}
+
+.resource-rail.open .rail-chip {
+  max-width: 100%;
 }
 
 .rail-chip:hover {
-  border-color: #dbd7cf;
-  background: #fff;
+  border-color: #d4d0c7;
+  background: #f1efe9;
+}
+
+.rail-chip:focus-visible {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 1px;
 }
 
 .rail-tag {
@@ -1053,6 +1092,7 @@ button {
 }
 
 .rail-chip-label {
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -1080,21 +1120,30 @@ button {
 }
 
 .rail-toggle {
-  flex: none;
-  width: 22px;
-  height: 22px;
-  display: grid;
-  place-items: center;
-  border: 0;
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
   border-radius: 6px;
   background: transparent;
-  color: #8b877f;
+  color: #6b6861;
   cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .rail-toggle:hover {
-  background: #ece8e0;
-  color: #2b2721;
+  background: #efede7;
+  color: #2b2a28;
+}
+
+.rail-toggle:focus-visible {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 1px;
 }
 
 .resource-rail.open .rail-toggle svg {
@@ -1102,7 +1151,7 @@ button {
 }
 
 .rail-panel {
-  padding: 2px 13px 9px 19px;
+  padding: 2px 16px 9px;
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -1112,8 +1161,8 @@ button {
   display: flex;
   align-items: center;
   gap: 9px;
-  height: 27px;
-  padding: 0 4px;
+  min-height: 27px;
+  padding: 2px 4px;
   border-radius: 7px;
 }
 
@@ -1131,13 +1180,13 @@ button {
   cursor: pointer;
   font-size: 12.5px;
   font-weight: 550;
-  overflow: hidden;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
   text-align: left;
   text-decoration: underline;
   text-decoration-color: #cdc8bf;
   text-underline-offset: 3px;
-  text-overflow: ellipsis;
 }
 
 .rail-row-label:hover {
@@ -1243,32 +1292,18 @@ button {
   color: #fff;
 }
 
-.session-title > div {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
 .session-title-icon {
   flex: 0 0 auto;
-  width: 33px;
-  height: 33px;
-}
-
-.session-title button {
-  padding: 0;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  border: 0;
-  background: transparent;
-  font-family: "Iowan Old Style", Georgia, serif;
-  font-size: 16px;
-  font-weight: 600;
-  -webkit-app-region: no-drag;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: #e3e0f0;
+  color: #6e5fa8;
 }
 
 .session-title-row {
-  width: 100%;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -1277,7 +1312,6 @@ button {
 
 .session-menu-wrap {
   flex: 0 0 auto;
-  position: relative;
   -webkit-app-region: no-drag;
 }
 
@@ -1290,210 +1324,399 @@ button {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #77736c;
+  color: #6b6861;
   cursor: pointer;
 }
 
 .session-title .session-menu-button:hover {
-  background: #efede8;
-  color: #302f2b;
+  background: #ebe9e3;
+  color: #2b2a28;
 }
 
+.session-title .session-menu-button:focus-visible {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 1px;
+}
+
+/* Anchored to the left edge of the identity cluster, not to the button, so a short title that
+   pushes the button toward the middle of a narrow pane cannot push the menu off the edge. */
 .session-menu {
   position: absolute;
-  z-index: 15;
-  top: 28px;
+  z-index: 30;
+  top: 32px;
   left: 0;
-  width: 150px;
-  padding: 5px;
+  width: 260px;
+  max-width: calc(100cqw - 32px);
+  padding: 6px;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
-  border: 1px solid #d8d5ce;
-  border-radius: 9px;
+  border: 1px solid #d9d6cf;
+  border-radius: 8px;
   background: #fbfaf8;
-  box-shadow: 0 14px 34px rgba(47, 43, 37, .18);
+  box-shadow: 0 8px 24px rgba(40, 35, 25, .14);
+}
+
+.session-menu-head {
+  padding: 8px 10px 10px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid #ece9e2;
+}
+
+.session-menu-title {
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  font-size: 14px;
+  color: #2b2a28;
+  word-break: break-word;
+}
+
+/* The compact badge in the header is only the folder name, so the full path is spelled out
+   here, where there is room to wrap it. */
+.session-menu-path {
+  margin-top: 3px;
+  color: #8a877f;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  word-break: break-all;
 }
 
 .session-title .session-menu button {
   height: 28px;
-  padding: 0 8px;
+  padding: 0 10px;
   display: flex;
   align-items: center;
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: #4c4943;
+  color: #2b2a28;
   cursor: pointer;
   font-family: inherit;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
 }
 
 .session-title .session-menu button:hover {
-  background: #eeece7;
+  background: #efede7;
+}
+
+.session-title .session-menu button:focus-visible {
+  outline: 0;
+  background: #e3e0f0;
 }
 
 .session-title .session-menu button.danger {
-  color: #a24e43;
+  color: #8f3030;
 }
 
 .session-title .session-menu button.danger:hover {
-  background: #f5e9e7;
+  background: #f6e9e6;
 }
 
 .session-title strong {
-  display: block;
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  font-family: "Iowan Old Style", Georgia, serif;
-  font-size: 16px;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  font-size: 15px;
   font-weight: 600;
+  letter-spacing: .01em;
+  color: #2b2a28;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-title input {
   width: 240px;
+  max-width: 100%;
   padding: 3px 5px;
   border: 1px solid #c5c1b8;
   border-radius: 5px;
   outline: 0;
   background: #fff;
-  font-family: "Iowan Old Style", Georgia, serif;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   font-size: 15px;
+  -webkit-app-region: no-drag;
 }
 
-.session-title small {
-  display: block;
+/* The folder, not the path. Compact enough to sit on the title line without stacking, and the
+   whole path is one click away in the session menu. */
+.session-project {
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 42%;
+  margin-left: 2px;
+  padding: 2px 7px;
   overflow: hidden;
-  margin-top: 3px;
-  color: #8d8981;
-  font-size: 11px;
+  border: 1px solid #e6e3dc;
+  border-radius: 5px;
+  background: #fbfaf8;
+  color: #8a877f;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.credit-visibility {
-  flex: 0 0 auto;
+/* The closed control carries the short name only. The native list it opens carries the cost
+   and speed metadata, and the platform draws it, so it cannot be clipped by the header. */
+.model-picker {
+  grid-area: center;
+  justify-self: center;
+  position: relative;
+  height: 28px;
+  min-width: 0;
+  max-width: 260px;
+  box-sizing: border-box;
+  padding: 0 9px 0 11px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
+  border: 1px solid #dcd9d1;
+  border-radius: 7px;
+  background: #fbfaf8;
+  cursor: pointer;
   -webkit-app-region: no-drag;
 }
 
-.credit-copy {
-  text-align: right;
+.model-picker:hover {
+  border-color: #cfcbc2;
+  background: #f1efe9;
 }
 
-.model-picker {
-  position: relative;
-  height: 40px;
-  min-width: 360px;
-  padding: 4px 27px 4px 9px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  border: 1px solid #d9d6cf;
-  border-radius: 7px;
-  background: #fbfaf8;
-}
-
-.model-picker > span {
-  color: #969189;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .04em;
-  text-transform: uppercase;
-}
-
-.model-picker select {
-  width: 100%;
-  padding: 0;
-  border: 0;
-  outline: 0;
-  appearance: none;
-  background: transparent;
-  color: #4b4842;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 650;
+.model-picker-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #2b2a28;
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .model-picker svg {
-  position: absolute;
-  right: 8px;
-  bottom: 9px;
+  flex: 0 0 auto;
+  color: #8a877f;
   pointer-events: none;
-  color: #88847d;
 }
 
-.credit-copy span,
-.credit-copy strong {
-  display: block;
-}
-
-.credit-copy > small {
-  display: block;
-  margin-top: 1px;
-  color: #928e86;
-  font-size: 11px;
-}
-
-.credit-copy span {
-  color: #8d8981;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .04em;
-  text-transform: uppercase;
-}
-
-.credit-copy strong {
-  margin-top: 2px;
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.credit-copy strong small {
-  color: #8c8880;
-  font-size: 11px;
-  font-weight: 500;
-}
-
-.credit-ring {
-  position: relative;
-  width: 35px;
-  height: 35px;
-}
-
-.credit-ring svg {
-  width: 100%;
-  height: 100%;
-  transform: rotate(-90deg);
-}
-
-.credit-ring path {
-  fill: none;
-  stroke-width: 3;
-}
-
-.ring-bg {
-  stroke: #e3e0da;
-}
-
-.ring-value {
-  stroke: #746e65;
-  stroke-dasharray: 68 32;
-  stroke-linecap: round;
-}
-
-.credit-ring > span {
+/* Kept in the layout rather than hidden, so it still takes focus, still announces itself and
+   still opens the platform popup on click. */
+.model-picker select {
   position: absolute;
   inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  opacity: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.model-picker:focus-within {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 2px;
+}
+
+.credit-visibility {
+  grid-area: right;
+  justify-self: end;
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  -webkit-app-region: no-drag;
+}
+
+/* Two lines and nothing else. Only the first line changes with state, so the row never
+   reflows and the number underneath never moves. */
+.credit-summary {
+  min-width: 0;
+  padding: 3px 7px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  line-height: 1.25;
+  text-align: right;
+}
+
+.credit-summary:hover {
+  background: #efede7;
+}
+
+.credit-summary:focus-visible {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 1px;
+}
+
+.credit-line-one {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.credit-line-two {
+  max-width: 100%;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tone-muted { color: #8a877f; }
+.tone-checked { color: #5f5c56; }
+.tone-failed { color: #8f3030; }
+.tone-low { color: #a4521a; }
+.tone-normal { color: #2b2a28; }
+
+.credit-refresh {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   display: grid;
   place-items: center;
-  font-size: 11px;
-  font-weight: 700;
+  border: 1px solid #dcd9d1;
+  border-radius: 7px;
+  background: #fbfaf8;
+  color: #6b6861;
+  cursor: pointer;
+}
+
+.credit-refresh:hover:not(:disabled) {
+  background: #f1efe9;
+}
+
+.credit-refresh:disabled {
+  opacity: .65;
+  cursor: default;
+}
+
+.credit-refresh:focus-visible {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 2px;
+}
+
+.credit-checked {
+  color: #3d7a4a;
+}
+
+/* Anchored to the right edge of its own cluster and capped to the pane, so it stays on screen
+   when the conversation column is narrow. */
+.credit-details {
+  position: absolute;
+  z-index: 30;
+  top: 36px;
+  right: 0;
+  width: 280px;
+  max-width: calc(100cqw - 32px);
+  padding: 12px 12px 10px;
+  box-sizing: border-box;
+  border: 1px solid #d9d6cf;
+  border-radius: 8px;
+  background: #fbfaf8;
+  box-shadow: 0 8px 24px rgba(40, 35, 25, .14);
+  color: #4d4a44;
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.credit-detail-row {
+  padding: 3px 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.credit-detail-row > span:first-child {
+  color: #8a877f;
+}
+
+.credit-detail-row > span:last-child {
+  color: #2b2a28;
+  font-variant-numeric: tabular-nums;
+}
+
+.credit-detail-warning {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #f6e9e6;
+  color: #8f3030;
+  font-size: 12px;
+}
+
+.credit-detail-note {
+  margin: 8px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid #ece9e2;
+  color: #8a877f;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.credit-detail-action {
+  margin-top: 10px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid #dcd9d1;
+  border-radius: 6px;
+  background: #fbfaf8;
+  color: #2b2a28;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.credit-detail-action:hover:not(:disabled) {
+  background: #f1efe9;
+}
+
+.credit-detail-action:disabled {
+  opacity: .65;
+  cursor: default;
+}
+
+.credit-detail-action:focus-visible {
+  outline: 2px solid #6e5fa8;
+  outline-offset: 2px;
+}
+
+/* Below this the three regions no longer fit side by side, so the model control takes its own
+   centred row and the title keeps the credits company on the first one. */
+@container conversation (max-width: 720px) {
+  .topbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "left right"
+      "center center";
+  }
+
+  .model-picker {
+    max-width: 100%;
+  }
+}
+
+@container conversation (max-width: 480px) {
+  .session-project {
+    display: none;
+  }
 }
 
 /* Pinned to the top right of the chat, so background work stays visible without stealing
@@ -2136,6 +2359,9 @@ button {
 }
 
 .markdown {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   color: #3d3b36;
   font-family: "Iowan Old Style", Georgia, serif;
   font-size: 15px;
@@ -2225,7 +2451,13 @@ button {
 }
 
 .markdown-table {
+  max-width: 100%;
   overflow-x: auto;
+}
+
+.markdown img {
+  max-width: 100%;
+  height: auto;
 }
 
 .markdown table {
@@ -2336,6 +2568,8 @@ button {
 }
 
 .code-block pre {
+  overflow-wrap: normal;
+  word-break: normal;
   margin: 0;
   padding: 11px;
   overflow-x: auto;
@@ -2779,6 +3013,27 @@ button {
 .queue-item button:hover {
   background: #ece8e0;
   color: #2b2721;
+}
+
+.queue-item .queue-send-now {
+  width: auto;
+  min-height: 26px;
+  padding: 3px 7px;
+  display: flex;
+  gap: 4px;
+  color: #5d5951;
+  font: inherit;
+}
+
+.queue-item button:disabled,
+.composer-actions .stop:disabled {
+  opacity: .5;
+  cursor: wait;
+}
+
+.queue-item button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
 }
 
 .session-queue-badge {

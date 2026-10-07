@@ -1,6 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { createQuotaRefresher } from './quota-refresh.mjs'
+import { interruptTurn, prioritizeQueuedMessage } from './turn-interruption.mjs'
 import {
   beginPlanTurn,
   createPlanLifecycleState,
@@ -1353,9 +1355,20 @@ function App() {
   const [paletteIndex, setPaletteIndex] = useState(0)
   const [tick, setTick] = useState(() => Date.now())
   const [quota, setQuota] = useState(null)
+  const quotaRefreshRef = useRef(null)
+  const [quotaUpdatedAt, setQuotaUpdatedAt] = useState(null)
+  const [quotaRefreshing, setQuotaRefreshing] = useState(false)
   // A read that failed is not a read still in flight, and the dial must not keep promising
   // figures that are never going to arrive.
   const [quotaFailed, setQuotaFailed] = useState(false)
+  // A check that comes back with the same numbers still has to read as a check that happened,
+  // otherwise pressing refresh against a lagging billing report looks like a dead button.
+  const [quotaFlash, setQuotaFlash] = useState(null)
+  const quotaFlashTimerRef = useRef(null)
+  const quotaUsedRef = useRef(null)
+  const [creditsOpen, setCreditsOpen] = useState(false)
+  const creditsButtonRef = useRef(null)
+  const sessionMenuButtonRef = useRef(null)
   const [capabilities, setCapabilities] = useState(null)
   const [knowledge, setKnowledge] = useState([])
   const [toolkitOpen, setToolkitOpen] = useState(false)
@@ -1473,6 +1486,8 @@ function App() {
   }, [artifactWidth])
   const queuesRef = useRef({})
   const [queues, setQueues] = useState({})
+  const stoppingRef = useRef(new Set())
+  const [stoppingSessions, setStoppingSessions] = useState([])
   const drainQueueRef = useRef(() => false)
   // When each session last produced any event, and when its turn was last declared over.
   const lastEventAtRef = useRef({})
@@ -1608,6 +1623,37 @@ function App() {
   const selected = sessions.find((session) => session.id === selectedId)
   const selectedWorkingDirectory = workingDirectoryOf(selected)
   const quotaSnapshot = quota?.premium_interactions || quota?.chat || null
+  // The header reports what is left, because that is the number a decision turns on. Used and
+  // entitlement stay available one click away in the details popover.
+  const quotaRemaining = quotaSnapshot
+    ? Math.max(0, quotaSnapshot.entitlementRequests - quotaSnapshot.usedRequests)
+    : null
+  const quotaLow = quotaSnapshot ? quotaSnapshot.remainingPercentage <= 15 : false
+  const quotaCheckedLabel = quotaUpdatedAt
+    ? new Date(quotaUpdatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : null
+  let creditLineOne = 'AI credits'
+  let creditTone = 'muted'
+  if (quotaRefreshing) {
+    creditLineOne = 'Checking...'
+  } else if (quotaFlash) {
+    creditLineOne = quotaFlash === 'same'
+      ? `Checked ${quotaCheckedLabel}, no change`
+      : `Checked ${quotaCheckedLabel}`
+    creditTone = 'checked'
+  } else if (quotaFailed && quotaSnapshot) {
+    creditLineOne = 'Check failed, last known'
+    creditTone = 'failed'
+  } else if (quotaLow) {
+    creditLineOne = 'AI credits, running low'
+    creditTone = 'low'
+  }
+  const creditLineTwo = quotaSnapshot
+    ? `${quotaRemaining.toLocaleString()} left / ${quotaSnapshot.entitlementRequests.toLocaleString()}`
+    : (quotaFailed ? 'Balance unavailable' : 'Checking balance...')
+  const creditValueTone = quotaSnapshot ? (quotaLow ? 'low' : 'normal') : (quotaFailed ? 'failed' : 'muted')
+  const refreshCredits = () => { void quotaRefreshRef.current?.() }
+  const selectedModelName = models.find((model) => model.id === selectedModel)?.name || 'Model'
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
   // A turn that has stopped producing events has stopped telling us anything, so after a while
@@ -2161,12 +2207,7 @@ function App() {
           if (!drainQueueRef.current(sessionId)) {
             patchSessionState(sessionId, { working: false })
           }
-          api.refreshQuota().then((result) => {
-            // A failed read leaves the last known figure on screen rather than blanking it.
-            // Stale usage is still useful; an empty dial is not.
-            if (result.ok && result.quota) setQuota(result.quota)
-            else setQuotaFailed(true)
-          }).catch((e) => showError(e?.message || String(e)))
+          void quotaRefreshRef.current?.()
         }
       }
       if (event.type === 'session.error') {
@@ -2219,6 +2260,7 @@ function App() {
       setModels(result.models)
       setSessions(sorted)
       setQuota(result.quota)
+      if (result.quota) setQuotaUpdatedAt(Date.now())
       if (!result.quota) setQuotaFailed(true)
       setCapabilities(result.capabilities)
       setKnowledge(result.capabilities?.knowledge || [])
@@ -2259,6 +2301,47 @@ function App() {
       unsubscribeCommands()
     }
   }, [api, beginPlanTurnForSession, createSession, finishPlanTurnForSession, markPlanChangedForSession, patchSessionState, showError])
+
+  useEffect(() => {
+    if (!ready || !api?.refreshQuota) return undefined
+    const refresher = createQuotaRefresher({
+      fetchQuota: () => api.refreshQuota(),
+      onRefreshing: setQuotaRefreshing,
+      shouldRefresh: () => document.visibilityState !== 'hidden',
+      onQuota: (next) => {
+        const snapshot = next?.premium_interactions || next?.chat || null
+        const used = snapshot ? snapshot.usedRequests : null
+        const previous = quotaUsedRef.current
+        quotaUsedRef.current = used
+        setQuota(next)
+        setQuotaFailed(false)
+        setQuotaUpdatedAt(Date.now())
+        // The first successful read is the balance arriving, not a re-check, so it gets no
+        // "checked" badge. Everything after it does, including a read that did not move.
+        if (previous !== null && used !== null) {
+          setQuotaFlash(used === previous ? 'same' : 'changed')
+          if (quotaFlashTimerRef.current) clearTimeout(quotaFlashTimerRef.current)
+          quotaFlashTimerRef.current = setTimeout(() => setQuotaFlash(null), 2500)
+        }
+      },
+      onError: () => {
+        setQuotaFailed(true)
+        setQuotaFlash(null)
+      },
+    })
+    quotaRefreshRef.current = refresher.refresh
+    const refresh = () => { void refresher.refresh() }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    refresh()
+    return () => {
+      refresher.stop()
+      quotaRefreshRef.current = null
+      if (quotaFlashTimerRef.current) clearTimeout(quotaFlashTimerRef.current)
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [api, ready])
 
   useEffect(() => {
     if (!api || !selectedId) return
@@ -2360,7 +2443,10 @@ function App() {
     if (!sessionMenuOpen) return undefined
     const close = () => setSessionMenuOpen(false)
     const closeOnEscape = (event) => {
-      if (event.key === 'Escape') setSessionMenuOpen(false)
+      if (event.key !== 'Escape') return
+      setSessionMenuOpen(false)
+      // Escape should land the caret back on the control that opened the menu, not on nothing.
+      sessionMenuButtonRef.current?.focus()
     }
     window.addEventListener('mousedown', close)
     window.addEventListener('keydown', closeOnEscape)
@@ -2369,6 +2455,27 @@ function App() {
       window.removeEventListener('keydown', closeOnEscape)
     }
   }, [sessionMenuOpen])
+
+  // The credit details popover is anchored inside the header, so a click that lands anywhere
+  // else, or Escape, has to put it away and hand focus back to its own summary button.
+  useEffect(() => {
+    if (!creditsOpen) return undefined
+    const close = (event) => {
+      if (event.target?.closest?.('.credit-visibility')) return
+      setCreditsOpen(false)
+    }
+    const closeOnEscape = (event) => {
+      if (event.key !== 'Escape') return
+      setCreditsOpen(false)
+      creditsButtonRef.current?.focus()
+    }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [creditsOpen])
 
   useEffect(() => {
     if (!rowMenu) return undefined
@@ -2647,6 +2754,7 @@ function App() {
   }, [api, beginPlanTurnForSession, finishPlanTurnForSession, patchSessionState, restoreDraft, showError])
 
   const drainQueue = useCallback((sessionId) => {
+    if (stoppingRef.current.has(sessionId)) return false
     const queue = queuesRef.current[sessionId]
     if (!queue?.length) return false
     const [next, ...rest] = queue
@@ -2661,12 +2769,12 @@ function App() {
   // nothing left to drain it. So: anything waiting means the new message joins the back, and an
   // idle session starts draining from the front straight away.
   const sendOrQueue = useCallback((sessionId, prompt, attachments, isWorking) => {
-    if (!isWorking && !queuesRef.current[sessionId]?.length) {
+    if (!isWorking && !stoppingRef.current.has(sessionId) && !queuesRef.current[sessionId]?.length) {
       deliverMessage(sessionId, prompt, attachments)
       return
     }
     writeQueue(sessionId, (items) => [...items, { id: crypto.randomUUID(), prompt, attachments }])
-    if (!isWorking) drainQueue(sessionId)
+    if (!isWorking && !stoppingRef.current.has(sessionId)) drainQueue(sessionId)
   }, [deliverMessage, drainQueue, writeQueue])
 
   useEffect(() => {
@@ -2918,46 +3026,54 @@ function App() {
   // means "this one is the point". So the queue survives: aborting ends the turn, the runtime
   // reports idle, and the normal idle handler sends whatever is queued. Throwing the queue away
   // here used to discard the very message the stop was meant to prioritise.
-  const stopSession = async () => {
+  const stopSession = async (queuedId = null) => {
     if (!selectedId) return
     const sessionId = selectedId
+    if (stoppingRef.current.has(sessionId)) return
     const turnId = planTurnIdsRef.current[sessionId] || 0
-    // Remember what was at the front so the fallback below can tell whether it was picked up.
-    const waitingId = queuesRef.current[sessionId]?.[0]?.id || null
-    const deliveriesBefore = deliveryCountRef.current[sessionId] || 0
+    setStoppingSessions((items) => [...items, sessionId])
+    try {
+      await interruptTurn({
+        sessionId,
+        pending: stoppingRef.current,
+        abort: (id) => api.abortSession(id),
+        onError: (error) => showError(error.message),
+        onStopped: () => {
+          // Ignore the old turn's trailing idle pair after the new message is handed off.
+          turnEndedAtRef.current[sessionId] = Date.now()
+          finishPlanTurnForSession(sessionId, turnId)
+          patchSessionState(sessionId, {
+            liveText: '', toolActivity: [], working: false, turnOutcome: 'stopped',
+          })
+          if (queuedId) {
+            const items = queuesRef.current[sessionId] || []
+            if (!items.some((item) => item.id === queuedId)) {
+              showError('This queued message is no longer available.')
+              return
+            }
+            writeQueue(sessionId, prioritizeQueuedMessage(items, queuedId))
+          }
+          drainQueueRef.current(sessionId)
+        },
+      })
+    } finally {
+      setStoppingSessions((items) => items.filter((id) => id !== sessionId))
+    }
+  }
 
-    const result = await api.abortSession(sessionId)
-    if (!result.ok) {
-      showError(result.error?.message || 'Could not stop this session.')
+  const sendQueuedNow = (queuedId) => {
+    if (!selectedId || stoppingRef.current.has(selectedId)) return
+    if (working) {
+      void stopSession(queuedId)
       return
     }
-
-    // Background shells and agents are detached from the turn and keep running after it ends,
-    // so they stay listed here exactly as they do on a normal idle. Their own liveness checks
-    // drop them when they actually finish.
-    finishPlanTurnForSession(sessionId, turnId)
-    patchSessionState(sessionId, { liveText: '', toolActivity: [] })
-    if (!waitingId) {
-      patchSessionState(sessionId, { working: false, turnOutcome: 'stopped' })
+    const items = queuesRef.current[selectedId] || []
+    if (!items.some((item) => item.id === queuedId)) {
+      showError('This queued message is no longer available.')
       return
     }
-
-    // A wedged session is the reason people reach for stop in the first place, and one that
-    // never reports idle would leave the message waiting for a turn that never ends. Give the
-    // normal path a moment, then send it directly. Nothing is sent twice: if the queue moved,
-    // the runtime already took it.
-    window.setTimeout(() => {
-      if ((deliveryCountRef.current[sessionId] || 0) > deliveriesBefore) return
-      if (queuesRef.current[sessionId]?.[0]?.id === waitingId) {
-        drainQueueRef.current(sessionId)
-        return
-      }
-      // Nothing was sent and the message is gone, so it was deleted by hand. There is no turn
-      // left to wait for, and the composer must not be left insisting it is working.
-      if (!drainQueueRef.current(sessionId)) {
-        patchSessionState(sessionId, { working: false, turnOutcome: 'stopped' })
-      }
-    }, 1500)
+    writeQueue(selectedId, prioritizeQueuedMessage(items, queuedId))
+    drainQueueRef.current(selectedId)
   }
 
   const forkSession = async (session) => {
@@ -3448,104 +3564,167 @@ function App() {
         <PreviewContext.Provider value={openPreview}>
         <header className="topbar">
           <div className="session-title">
-            <span className="session-title-icon"><TerminalSquare size={16} /></span>
-            <div>
-              {selected ? (
-                editingSession ? (
-                  <input
-                    autoFocus
-                    defaultValue={aliases[selected.id] || selected.title}
-                    onBlur={(event) => renameSession(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.nativeEvent.isComposing || event.keyCode === 229) return
-                      if (event.key === 'Enter') renameSession(event.currentTarget.value)
-                      if (event.key === 'Escape') setEditingSession(false)
-                    }}
-                  />
-                ) : (
-                  <div className="session-title-row">
-                    <strong title={aliases[selected.id] || selected.title}>
-                      {aliases[selected.id] || selected.title}
-                    </strong>
-                    <div className="session-menu-wrap" onMouseDown={(event) => event.stopPropagation()}>
-                      <button
-                        type="button"
-                        className="session-menu-button"
-                        title="Session options"
-                        aria-label="Session options"
-                        aria-expanded={sessionMenuOpen}
-                        onClick={() => setSessionMenuOpen((value) => !value)}
-                      >
-                        <MoreHorizontal size={15} />
-                      </button>
-                      {sessionMenuOpen && (
-                        <div className="session-menu">
-                          <button type="button" onClick={() => { setSessionMenuOpen(false); setEditingSession(true) }}>
-                            Rename
-                          </button>
-                          <button type="button" onClick={() => { setSessionMenuOpen(false); toggleSessionPin(selected.id) }}>
-                            {pinnedSessionIds.includes(selected.id) ? 'Unpin' : 'Pin'}
-                          </button>
-                          <button type="button" onClick={() => { setSessionMenuOpen(false); forkSession(selected) }}>
-                            Fork this session
-                          </button>
-                          <button
-                            type="button"
-                            className="danger"
-                            onClick={() => { setSessionMenuOpen(false); setSessionToDelete(selected) }}
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )
+            <span className="session-title-icon"><TerminalSquare size={13} /></span>
+            {selected ? (
+              editingSession ? (
+                <input
+                  autoFocus
+                  defaultValue={aliases[selected.id] || selected.title}
+                  onBlur={(event) => renameSession(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.nativeEvent.isComposing || event.keyCode === 229) return
+                    if (event.key === 'Enter') renameSession(event.currentTarget.value)
+                    if (event.key === 'Escape') setEditingSession(false)
+                  }}
+                />
               ) : (
+                <div className="session-title-row">
+                  <strong title={aliases[selected.id] || selected.title}>
+                    {aliases[selected.id] || selected.title}
+                  </strong>
+                  <div className="session-menu-wrap" onMouseDown={(event) => event.stopPropagation()}>
+                    <button
+                      type="button"
+                      ref={sessionMenuButtonRef}
+                      className="session-menu-button"
+                      title="Session options"
+                      aria-label="Session options"
+                      aria-haspopup="menu"
+                      aria-expanded={sessionMenuOpen}
+                      onClick={() => setSessionMenuOpen((value) => !value)}
+                    >
+                      <MoreHorizontal size={14} />
+                    </button>
+                    {sessionMenuOpen && (
+                      <div className="session-menu" role="menu" aria-label="Session menu">
+                        {/* The badge beside the title is only the folder name, so the full path
+                            has to be readable somewhere. This is that somewhere. */}
+                        <div className="session-menu-head">
+                          <div className="session-menu-title">{aliases[selected.id] || selected.title}</div>
+                          <div className="session-menu-path">
+                            {selectedWorkingDirectory || 'Local session'}
+                          </div>
+                        </div>
+                        <button type="button" role="menuitem" onClick={() => { setSessionMenuOpen(false); setEditingSession(true) }}>
+                          Rename
+                        </button>
+                        <button type="button" role="menuitem" onClick={() => { setSessionMenuOpen(false); toggleSessionPin(selected.id) }}>
+                          {pinnedSessionIds.includes(selected.id) ? 'Unpin' : 'Pin'}
+                        </button>
+                        <button type="button" role="menuitem" onClick={() => { setSessionMenuOpen(false); forkSession(selected) }}>
+                          Fork this session
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="danger"
+                          onClick={() => { setSessionMenuOpen(false); setSessionToDelete(selected) }}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <span className="session-project" title={selectedWorkingDirectory || 'Local session'}>
+                    {projectName(selected)}
+                  </span>
+                </div>
+              )
+            ) : (
+              <div className="session-title-row">
                 <strong>HC Copilot</strong>
-              )}
-              <small>
-                {selected
-                  ? `${projectName(selected)} · ${selectedWorkingDirectory || 'Local session'}`
-                  : 'Choose a folder to start'}
-              </small>
-            </div>
+                <span className="session-project">Choose a folder to start</span>
+              </div>
+            )}
           </div>
 
+          {/* A native select keeps keyboard and screen reader behaviour, and its popup is drawn
+              by the platform so it can never be clipped by the header. The closed control shows
+              the short name only; the cost and speed metadata lives in the open list. */}
+          <label className="model-picker">
+            <span className="model-picker-name">{models.length ? selectedModelName : 'Loading models'}</span>
+            <ChevronDown size={11} aria-hidden="true" />
+            <select
+              aria-label={`Model: ${selectedModelName}`}
+              value={selectedModel}
+              onChange={(event) => changeModel(event.target.value)}
+              disabled={!models.length}
+            >
+              {models.length
+                ? models.map((model) => <option key={model.id} value={model.id}>{modelLabel(model)}</option>)
+                : <option value={selectedModel}>Loading models</option>}
+            </select>
+          </label>
+
           <div className="credit-visibility">
-            <label className="model-picker">
-              <span>Model</span>
-              <select value={selectedModel} onChange={(event) => changeModel(event.target.value)} disabled={!models.length}>
-                {models.length
-                  ? models.map((model) => <option key={model.id} value={model.id}>{modelLabel(model)}</option>)
-                  : <option>Loading models</option>}
-              </select>
-              <ChevronDown size={13} />
-            </label>
-            <div className="credit-copy">
-              <span>AI credits</span>
-              <strong>
-                {quotaSnapshot
-                  ? `${quotaSnapshot.usedRequests.toLocaleString()} / ${quotaSnapshot.entitlementRequests.toLocaleString()}`
-                  : '...'}
-              </strong>
-              <small>
-                {quotaSnapshot
-                  ? `${quotaSnapshot.remainingPercentage.toFixed(1)}% left`
-                  : (quotaFailed ? 'Usage unavailable' : 'Loading usage')}
-              </small>
-            </div>
-            <div className="credit-ring">
-              <svg viewBox="0 0 36 36">
-                <path className="ring-bg" d="M18 2.5a15.5 15.5 0 1 1 0 31 15.5 15.5 0 1 1 0-31" />
-                <path
-                  className="ring-value"
-                  pathLength="100"
-                  style={{ strokeDasharray: `${quotaSnapshot?.remainingPercentage || 0} 100` }}
-                  d="M18 2.5a15.5 15.5 0 1 1 0 31 15.5 15.5 0 1 1 0-31"
-                />
-              </svg>
-            </div>
+            <button
+              type="button"
+              ref={creditsButtonRef}
+              className="credit-summary"
+              aria-haspopup="dialog"
+              aria-expanded={creditsOpen}
+              aria-label={`AI credits, ${creditLineTwo}. Show details`}
+              onClick={() => setCreditsOpen((value) => !value)}
+            >
+              <span className={`credit-line-one tone-${creditTone}`} aria-live="polite">{creditLineOne}</span>
+              <strong className={`credit-line-two tone-${creditValueTone}`}>{creditLineTwo}</strong>
+            </button>
+            <button
+              type="button"
+              className="credit-refresh"
+              onClick={refreshCredits}
+              disabled={!ready || quotaRefreshing}
+              title={quotaFailed ? 'Retry credit check' : 'Check credits now'}
+              aria-label={quotaFailed ? 'Retry credit check' : 'Check credits now'}
+            >
+              {quotaRefreshing
+                ? <RefreshCw size={14} className="spin" />
+                : (quotaFlash ? <Check size={14} className="credit-checked" /> : <RefreshCw size={14} />)}
+            </button>
+            {creditsOpen && (
+              <div className="credit-details" role="dialog" aria-label="AI credit details">
+                <div className="credit-detail-row">
+                  <span>Last checked</span>
+                  <span className={quotaFailed ? 'tone-failed' : ''}>
+                    {quotaCheckedLabel ? `${quotaCheckedLabel}${quotaFailed ? ' (last success)' : ''}` : 'Never'}
+                  </span>
+                </div>
+                <div className="credit-detail-row">
+                  <span>Used</span>
+                  <span>
+                    {quotaSnapshot
+                      ? `${quotaSnapshot.usedRequests.toLocaleString()} of ${quotaSnapshot.entitlementRequests.toLocaleString()}`
+                      : 'Unknown'}
+                  </span>
+                </div>
+                <div className="credit-detail-row">
+                  <span>Remaining</span>
+                  <span className={quotaLow ? 'tone-low' : ''}>
+                    {quotaRemaining === null
+                      ? 'Unknown'
+                      : `${quotaRemaining.toLocaleString()} (${quotaSnapshot.remainingPercentage.toFixed(1)}%)`}
+                  </span>
+                </div>
+                {quotaFailed && quotaSnapshot && (
+                  <p className="credit-detail-warning">
+                    The last check failed. The balance above is from the last successful check.
+                  </p>
+                )}
+                <p className="credit-detail-note">
+                  Checked every 5 minutes while the app is visible, when you come back to it, and
+                  after each turn. GitHub usage reporting can lag a few minutes, so a check may
+                  come back with the same numbers.
+                </p>
+                <button
+                  type="button"
+                  className="credit-detail-action"
+                  onClick={refreshCredits}
+                  disabled={!ready || quotaRefreshing}
+                >
+                  {quotaRefreshing ? 'Checking...' : (quotaFailed ? 'Retry check' : 'Check now')}
+                </button>
+              </div>
+            )}
           </div>
         </header>
 
@@ -3565,8 +3744,10 @@ function App() {
                       setRailMenu({ item, x: event.clientX, y: event.clientY })
                     }}
                     title={`${item.label} · ${item.value}`}
+                    aria-label={`${kindLabel(item.kind)} ${item.value}`}
                   >
                     <span className={`rail-tag kind-${item.kind}`}>{kindLabel(item.kind)}</span>
+                    <span className="rail-chip-label">{item.label}</span>
                   </button>
                 ))}
                 {railOpen && <span className="rail-heading">Resources in this session</span>}
@@ -3576,9 +3757,14 @@ function App() {
                 className="rail-toggle"
                 onClick={() => setRailOpen((value) => !value)}
                 aria-expanded={railOpen}
-                aria-label={railOpen ? 'Collapse resources' : 'Expand resources'}
+                aria-label={railOpen
+                  ? 'Collapse resources'
+                  : `Expand ${resources.length} ${resources.length === 1 ? 'resource' : 'resources'}`}
               >
-                <ChevronDown size={14} />
+                <span className="rail-toggle-label">
+                  {railOpen ? 'Hide' : `${resources.length} ${resources.length === 1 ? 'resource' : 'resources'}`}
+                </span>
+                <ChevronDown size={11} aria-hidden="true" />
               </button>
             </div>
 
@@ -4017,7 +4203,17 @@ function App() {
                       </span>
                     )}
                     <button
+                      className="queue-send-now"
+                      onClick={() => sendQueuedNow(item.id)}
+                      disabled={stoppingSessions.includes(selectedId)}
+                      aria-label={`Send queued message ${index + 1} now`}
+                      title={working ? 'Stop the current turn and send this message now' : 'Send this message now'}
+                    >
+                      <Send size={11} /> Send now
+                    </button>
+                    <button
                       onClick={() => removeQueued(selectedId, item.id)}
+                      disabled={stoppingSessions.includes(selectedId)}
                       aria-label={`Remove queued message ${index + 1}`}
                       title="Remove from queue"
                     >
@@ -4118,16 +4314,19 @@ function App() {
                 </button>
               </div>
               <div className="composer-send-group">
-                {working && (
+                {(working || stoppingSessions.includes(selectedId)) && (
                   <button
                     className="stop"
-                    onClick={stopSession}
+                    onClick={() => { void stopSession() }}
+                    disabled={stoppingSessions.includes(selectedId)}
                     title={selectedQueue.length
                       ? 'End this turn and send the next queued message'
                       : 'End this turn'}
                     aria-label={selectedQueue.length ? 'Stop and send next' : 'Stop'}
                   >
-                    <Square size={12} /> {selectedQueue.length ? 'Stop and send next' : 'Stop'}
+                    <Square size={12} /> {stoppingSessions.includes(selectedId)
+                      ? 'Stopping...'
+                      : (selectedQueue.length ? 'Stop and send next' : 'Stop')}
                   </button>
                 )}
                 {messages.length > 0 && (
