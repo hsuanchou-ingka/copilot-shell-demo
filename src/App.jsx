@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { isMainConversationEvent } from '../shared/agent-events.mjs'
 import { createQuotaRefresher } from './quota-refresh.mjs'
 import { interruptTurn, prioritizeQueuedMessage } from './turn-interruption.mjs'
 import {
@@ -834,6 +835,9 @@ function fileNameOf(filePath) {
 function messagesFromEvents(events) {
   const seen = new Set()
   return events
+    // A delegated agent's prompt and replies belong to its own conversation. Replaying them
+    // here is what put a briefing the user never wrote into the chat as if they had.
+    .filter((event) => isMainConversationEvent(event))
     .filter((event) => ['user.message', 'assistant.message'].includes(event.type))
     .map((event, index) => ({
       id: event.id || event.data?.messageId || `${event.type}-${index}`,
@@ -2130,18 +2134,31 @@ function App() {
 
     const unsubscribeEvents = api.onEvent(({ sessionId, event }) => {
       const isSelected = sessionId === selectedIdRef.current
+      // A delegated agent working away is still proof this session is alive, so this counts
+      // every event. It only feeds the "nothing has been heard for a while" notice.
       lastEventAtRef.current[sessionId] = Date.now()
+
+      // Background work is background work whoever started it, and the handoff notices carry
+      // the child's id, so this one reads the whole stream.
+      patchSessionState(sessionId, (current) => foldBackgroundActivity(current, event))
+
+      // Signal-only event: the plan changed and has to be re-read. Only the visible chat needs
+      // to react, since the panel reads for whichever chat is selected. The re-read goes to the
+      // session's own plan either way, so it is left unfiltered.
+      if (event.type === 'session.todos_changed') {
+        markPlanChangedForSession(sessionId)
+        setPlanRevision((value) => value + 1)
+      }
+
+      // Everything below speaks for the main conversation: its transcript, its spinner, its
+      // queue, its errors. A delegated agent has none of those and must not borrow them.
+      if (!isMainConversationEvent(event)) return
+
       // Work under way clears the debounce below, so a turn that starts and ends quickly still
       // registers its own ending rather than being mistaken for an echo of the previous one.
       if (TURN_ACTIVE_EVENTS.has(event.type)) {
         turnEndedAtRef.current[sessionId] = 0
         beginPlanTurnForSession(sessionId)
-      }
-      // Signal-only event: the plan changed and has to be re-read. Only the visible chat needs
-      // to react, since the panel reads for whichever chat is selected.
-      if (event.type === 'session.todos_changed') {
-        markPlanChangedForSession(sessionId)
-        setPlanRevision((value) => value + 1)
       }
 
       if (event.type === 'assistant.message_delta') {
@@ -2193,7 +2210,6 @@ function App() {
           )),
         }))
       }
-      patchSessionState(sessionId, (current) => foldBackgroundActivity(current, event))
 
       if (TURN_END_EVENTS.has(event.type)) {
         const now = Date.now()

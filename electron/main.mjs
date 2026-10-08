@@ -7,6 +7,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { CopilotClient } from '@github/copilot-sdk'
+import { isMainConversationEvent } from '../shared/agent-events.mjs'
 import { dropDisconnectedClient, getReusableSession } from './client-cache.mjs'
 import { isOwnAppPage, isTrustedRendererEvent, registerIpcHandle as registerSecureIpcHandle } from './security.mjs'
 
@@ -353,7 +354,9 @@ function attachSession(session) {
       sessionId: session.sessionId,
       event,
     })
-    if (event?.type === 'session.idle') {
+    // A delegated agent going quiet says nothing about the chat's own title or context, and
+    // the refresh is a round trip, so only the main conversation's idle triggers one.
+    if (event?.type === 'session.idle' && isMainConversationEvent(event)) {
       refreshSessionMetadata(session.sessionId)
     }
     if (event?.type === 'session.error') {
@@ -742,7 +745,11 @@ registerIpcHandle('copilot:send-message', async (_event, payload) => {
 registerIpcHandle('copilot:session-busy', async (_event, sessionId) => {
   try {
     const session = await resumeSession(sessionId)
-    const types = (await session.getEvents()).map((event) => event.type)
+    const types = (await session.getEvents())
+      // A delegated agent opens and closes turns of its own inside the same transcript. Left in,
+      // one still running puts the main conversation's composer in a spinner it cannot leave.
+      .filter((event) => isMainConversationEvent(event))
+      .map((event) => event.type)
     const lastUser = types.lastIndexOf('user.message')
     const lastStart = types.lastIndexOf('assistant.turn_start')
     const lastEnd = types.lastIndexOf('assistant.turn_end')
