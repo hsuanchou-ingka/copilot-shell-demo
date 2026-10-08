@@ -340,6 +340,61 @@ async function refreshSessionMetadata(sessionId) {
   }
 }
 
+// The event types the window acts on by name. Everything the runtime emits is still seen here,
+// but the rest only ever served the window as a sign of life, and some of them arrive in the
+// hundreds per turn. Each one sent across costs the window a pass through its event handler.
+const RENDERER_EVENT_TYPES = new Set([
+  'user.message',
+  'assistant.message',
+  'assistant.message_start',
+  'assistant.message_delta',
+  'assistant.reasoning_delta',
+  'assistant.tool_call_delta',
+  'assistant.idle',
+  'model.turn_started',
+  'tool.execution_start',
+  'tool.execution_complete',
+  'system.notification',
+  'subagent.started',
+  'subagent.configured',
+  'subagent.completed',
+  'subagent.failed',
+  'session.todos_changed',
+  'session.error',
+  'session.idle',
+])
+// The window counts any event as proof that a session is alive, and says so when a turn goes
+// quiet for a long time. A long command or a model that streams nothing visible can produce
+// nothing but these other events for minutes, so one of them still goes across this often.
+const HEARTBEAT_EVERY_MS = 5000
+const lastHeartbeatAt = new Map()
+
+function shouldForward(sessionId, event) {
+  if (RENDERER_EVENT_TYPES.has(event?.type)) return true
+  const now = Date.now()
+  if (now - (lastHeartbeatAt.get(sessionId) || 0) < HEARTBEAT_EVERY_MS) return false
+  lastHeartbeatAt.set(sessionId, now)
+  return true
+}
+
+// Whether each session has a turn under way, kept from the live stream as it passes through. The
+// window asks every few seconds while a turn runs, and answering by reading the transcript meant
+// parsing tens of megabytes on this process, which also forwards every event, so the whole app
+// stalled each time. A session missing from the map has not been seen live since this process
+// started, and only then is the transcript read; that answer is kept until the stream speaks.
+const liveBusy = new Map()
+const BUSY_START_TYPES = new Set(['user.message', 'assistant.turn_start', 'model.turn_started'])
+// session.error is here as well: the window already treats it as the end of the turn, and a flag
+// left on after it would bring the spinner back the next time the chat is opened.
+const BUSY_END_TYPES = new Set(['assistant.idle', 'session.idle', 'session.error'])
+
+function trackBusy(sessionId, event) {
+  // A delegated agent starting and finishing its own turns says nothing about the main one.
+  if (!isMainConversationEvent(event)) return
+  if (BUSY_START_TYPES.has(event.type)) liveBusy.set(sessionId, true)
+  else if (BUSY_END_TYPES.has(event.type)) liveBusy.set(sessionId, false)
+}
+
 function attachSession(session) {
   const existing = activeSessions.get(session.sessionId)
   // Same handle, already wired up.
@@ -348,12 +403,18 @@ function attachSession(session) {
   // and stopped delivering events to the old one. Returning early here would leave us
   // subscribed to a handle that has gone quiet, so the old subscription is dropped instead.
   if (existing) existing.unsubscribe()
+  // A new handle means events may have gone unheard since the last one, after a reconnect for
+  // instance, so whatever the stream last said about this session is no longer trusted.
+  liveBusy.delete(session.sessionId)
 
   const unsubscribe = session.on((event) => {
-    sendToRenderer('copilot:event', {
-      sessionId: session.sessionId,
-      event,
-    })
+    trackBusy(session.sessionId, event)
+    if (shouldForward(session.sessionId, event)) {
+      sendToRenderer('copilot:event', {
+        sessionId: session.sessionId,
+        event,
+      })
+    }
     // A delegated agent going quiet says nothing about the chat's own title or context, and
     // the refresh is a round trip, so only the main conversation's idle triggers one.
     if (event?.type === 'session.idle' && isMainConversationEvent(event)) {
@@ -742,8 +803,12 @@ registerIpcHandle('copilot:send-message', async (_event, payload) => {
 // on a long turn is most of the time it is running. What actually settles it is whether a turn
 // was left open: work is under way while the assistant has started a turn it has not closed, or
 // while the last thing on record is the user asking for something.
+//
+// That read is slow on a long chat, so it is only the fallback. The live stream answers whenever
+// this process has seen the session speak; see liveBusy above.
 registerIpcHandle('copilot:session-busy', async (_event, sessionId) => {
   try {
+    if (liveBusy.has(sessionId)) return { ok: true, busy: liveBusy.get(sessionId) }
     const session = await resumeSession(sessionId)
     const types = (await session.getEvents())
       // A delegated agent opens and closes turns of its own inside the same transcript. Left in,
@@ -755,7 +820,10 @@ registerIpcHandle('copilot:session-busy', async (_event, sessionId) => {
     const lastEnd = types.lastIndexOf('assistant.turn_end')
     // session.start counts as a boundary so a chat that has never been used reads as idle.
     const lastBoundary = Math.max(lastEnd, types.lastIndexOf('session.start'))
-    return { ok: true, busy: lastUser > lastBoundary || lastStart > lastEnd }
+    const busy = lastUser > lastBoundary || lastStart > lastEnd
+    // A live event that arrived during the read is newer than the transcript, so it wins.
+    if (!liveBusy.has(sessionId)) liveBusy.set(sessionId, busy)
+    return { ok: true, busy: liveBusy.get(sessionId) }
   } catch (error) {
     return { ok: false, error: serializeError(error) }
   }
@@ -998,6 +1066,8 @@ registerIpcHandle('copilot:delete-session', async (_event, sessionId) => {
       })
     }
     rejectPendingPermissionsForSession(sessionId)
+    liveBusy.delete(sessionId)
+    lastHeartbeatAt.delete(sessionId)
     const copilot = await getClient()
     await copilot.deleteSession(sessionId)
     return { ok: true }

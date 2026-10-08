@@ -2611,6 +2611,19 @@ button {
   color: #97928a;
 }
 
+/* What the model is doing while the answer has not started. One line in the same quiet grey,
+   lined up with the label above it rather than the spinner, and clipped instead of wrapping so
+   the conversation does not jump as the text changes. */
+.thinking-detail {
+  margin: 3px 0 0 21px;
+  max-width: 100%;
+  overflow: hidden;
+  color: #97928a;
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 /* The counterpart: a turn that has ended says so. Same size and colour family as the working
    line it replaces, so the swap reads as one state becoming another rather than a new thing
    appearing. The tick borrows the settled green already used for completed plan steps. */

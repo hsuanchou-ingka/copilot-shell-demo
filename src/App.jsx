@@ -1,8 +1,17 @@
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { isMainConversationEvent } from '../shared/agent-events.mjs'
 import { createQuotaRefresher } from './quota-refresh.mjs'
+import {
+  STREAM_DELTA_TYPES,
+  applySessionPatch,
+  applyStreamChunk,
+  createStreamBuffer,
+  defaultModelId,
+  progressLine,
+  toolArgumentDetail,
+} from './live-stream.mjs'
 import { interruptTurn, prioritizeQueuedMessage } from './turn-interruption.mjs'
 import {
   beginPlanTurn,
@@ -66,6 +75,9 @@ const EMPTY_SESSION_STATE = {
   // Why it ended: done, stopped by hand, or failed. A turn the user cut short must not be
   // reported back to them as finished work.
   turnOutcome: '',
+  // What the model is doing before its answer starts: the tail of its reasoning, or the tool it
+  // is about to run. Shown as one quiet line under "Working" and cleared once the answer streams.
+  progress: null,
 }
 const EMPTY_QUEUE = []
 const EMPTY_TASKS = []
@@ -1096,16 +1108,20 @@ const markdownComponents = {
   ),
 }
 
-function MessageBody({ role, content }) {
+const REMARK_PLUGINS = [remarkGfm]
+
+// Parsing markdown is the most expensive thing on screen, and the window redraws many times a
+// second while a turn streams. A message whose text has not changed is not parsed again.
+const MessageBody = memo(function MessageBody({ role, content }) {
   const source = role === 'user' ? withHardBreaks(content) : content
   return (
     <div className="markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>
         {source}
       </ReactMarkdown>
     </div>
   )
-}
+})
 
 function MessageAttachment({ item }) {
   const [thumbnail, setThumbnail] = useState(item.thumbnail || '')
@@ -1169,6 +1185,31 @@ function MessageStatus({ status, attachmentCount }) {
     </div>
   )
 }
+
+// One finished message in the transcript. Message objects are only replaced when they change,
+// so a redraw caused by anything else, such as the clock or a streamed reply below, skips every
+// row that is already on screen.
+const MessageRow = memo(function MessageRow({ item }) {
+  return (
+    <article className={`message ${item.role}`}>
+      {item.role !== 'user' && <div className="avatar copilot"><Sparkles size={15} /></div>}
+      <div>
+        <div className="speaker">{item.role === 'user' ? 'You' : 'Copilot'}</div>
+        {!!item.attachments?.length && (
+          <div className="message-attachments">
+            {item.attachments.map((attachment) => (
+              <MessageAttachment item={attachment} key={attachment.path} />
+            ))}
+          </div>
+        )}
+        <MessageBody role={item.role} content={item.content} />
+        {item.role === 'user' && (
+          <MessageStatus status={item.status} attachmentCount={item.attachments?.length || 0} />
+        )}
+      </div>
+    </article>
+  )
+})
 
 function ArtifactPanel({ artifact, onClose, onError }) {
   const [tab, setTab] = useState('preview')
@@ -1344,7 +1385,9 @@ function App() {
   const [models, setModels] = useState([])
   const [sessions, setSessions] = useState([])
   const [selectedId, setSelectedId] = useState(null)
-  const [selectedModel, setSelectedModel] = useState('auto')
+  // Nothing is known about the account before the model list arrives, so this starts on "auto"
+  // and is replaced by the preferred default as soon as the list is in.
+  const [selectedModel, setSelectedModel] = useState(() => defaultModelId([]))
   const [messages, setMessages] = useState([])
   const [sessionState, setSessionState] = useState({})
   const [backgroundProbes, setBackgroundProbes] = useState({})
@@ -1434,6 +1477,11 @@ function App() {
   const jumpToMyTurnRef = useRef(null)
   const selectedIdRef = useRef(selectedId)
   const selectedModelRef = useRef(selectedModel)
+  // The model list and whether "auto" was picked by hand in this window. A chat opened from disk
+  // reports the model it was created with, and older chats were all created on "auto". That value
+  // describes the old chat; it is not a choice to carry into new ones.
+  const modelsRef = useRef([])
+  const autoChosenRef = useRef(false)
   const selectedProjectRef = useRef(selectedProject)
   const planTurnIdsRef = useRef({})
   const planTurnActiveRef = useRef({})
@@ -1660,6 +1708,7 @@ function App() {
   const selectedModelName = models.find((model) => model.id === selectedModel)?.name || 'Model'
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
+  const workingDetail = working ? progressLine(liveState.progress) : ''
   // A turn that has stopped producing events has stopped telling us anything, so after a while
   // the composer says how long it has been quiet instead of implying steady progress. Reading
   // tick here is what keeps the label counting up.
@@ -1850,20 +1899,21 @@ function App() {
     return pickPrimary(merged)
   }, [messages, selectedWorkingDirectory, sessionEdits])
 
+  // Every live event passes through here, and most of them change nothing. The helper hands the
+  // same state object back when a patch is a no-op, which is what stops each of those events from
+  // redrawing the whole window. It also stamps the end of a turn; see applySessionPatch.
   const patchSessionState = useCallback((sessionId, patch) => {
-    setSessionState((current) => {
-      const previous = current[sessionId] || EMPTY_SESSION_STATE
-      const next = typeof patch === 'function' ? patch(previous) : { ...previous, ...patch }
-      // Stamped here rather than at each of the several places a turn can end, so no route out
-      // of a turn can forget to record that it happened. Callers that end a turn for a reason
-      // other than the work being done say so in the same patch.
-      if (previous.working && !next.working && !next.turnEndedAt) {
-        next.turnEndedAt = Date.now()
-        if (!next.turnOutcome) next.turnOutcome = 'done'
-      }
-      return { ...current, [sessionId]: next }
-    })
+    setSessionState((current) => applySessionPatch(current, sessionId, patch, EMPTY_SESSION_STATE))
   }, [])
+
+  // Streamed text arrives in bursts of dozens of tiny events. They are collected here and folded
+  // into state once per frame, so a burst costs one redraw rather than one per event.
+  const streamBuffer = useMemo(() => createStreamBuffer({
+    schedule: (run) => window.requestAnimationFrame(run),
+    cancel: (handle) => window.cancelAnimationFrame(handle),
+    apply: (sessionId, chunk) => patchSessionState(sessionId, (current) => applyStreamChunk(current, chunk)),
+  }), [patchSessionState])
+  useEffect(() => () => streamBuffer.dispose(), [streamBuffer])
 
   const showError = useCallback((text, options = {}) => {
     if (!text) return
@@ -2106,8 +2156,9 @@ function App() {
   const createSession = useCallback(async (options = {}) => {
     const activeProject = selectedProjectRef.current
     const workingDirectory = options.chooseFolder || !isFolderKey(activeProject) ? '' : activeProject
+    const picked = selectedModelRef.current
     const result = await api.createSession({
-      model: selectedModelRef.current,
+      model: picked === 'auto' && !autoChosenRef.current ? defaultModelId(modelsRef.current) : picked,
       workingDirectory,
       chooseFolder: Boolean(options.chooseFolder),
     })
@@ -2161,16 +2212,21 @@ function App() {
         beginPlanTurnForSession(sessionId)
       }
 
-      if (event.type === 'assistant.message_delta') {
-        patchSessionState(sessionId, (current) => ({
-          ...current,
-          working: true,
-          liveText: current.liveText + (event.data?.deltaContent || ''),
-        }))
+      // Streamed text waits for the next frame. Anything else first releases what is waiting for
+      // this session, so a reply is never cleared and then refilled by its own late fragments.
+      if (STREAM_DELTA_TYPES.has(event.type)) {
+        streamBuffer.push(sessionId, event)
+        return
+      }
+      streamBuffer.flush(sessionId)
+
+      // The answer has begun, so the line saying what the model was doing makes way for it.
+      if (event.type === 'assistant.message_start') {
+        patchSessionState(sessionId, { progress: null })
       }
       if (event.type === 'assistant.message') {
         const content = eventContent(event)
-        patchSessionState(sessionId, { liveText: '' })
+        patchSessionState(sessionId, { liveText: '', progress: null })
         if (content && isSelected) {
           setMessages((items) => mergeMessage(items, {
             id: event.id || event.data?.messageId || crypto.randomUUID(),
@@ -2200,6 +2256,13 @@ function App() {
             name: event.data?.toolName || 'Using a tool',
             status: 'running',
           }],
+          progress: {
+            kind: 'tool',
+            id: event.data?.toolCallId || '',
+            name: event.data?.toolName || '',
+            input: '',
+            detail: toolArgumentDetail(event.data?.arguments),
+          },
         }))
       }
       if (event.type === 'tool.execution_complete') {
@@ -2208,6 +2271,10 @@ function App() {
           toolActivity: current.toolActivity.map((item) => (
             item.id === event.data?.toolCallId ? { ...item, status: 'done' } : item
           )),
+          // A finished tool is no longer something the model is doing.
+          progress: current.progress?.kind === 'tool' && current.progress.id === event.data?.toolCallId
+            ? null
+            : current.progress,
         }))
       }
 
@@ -2217,7 +2284,7 @@ function App() {
         if (now - (turnEndedAtRef.current[sessionId] || 0) > TURN_END_WINDOW_MS) {
           turnEndedAtRef.current[sessionId] = now
           // Background shells and agents outlive a turn, so they are never cleared here.
-          patchSessionState(sessionId, { liveText: '', toolActivity: [] })
+          patchSessionState(sessionId, { liveText: '', toolActivity: [], progress: null })
           finishPlanTurnForSession(sessionId)
           // Only fall back to idle when nothing is queued, so the composer never flickers between turns.
           if (!drainQueueRef.current(sessionId)) {
@@ -2233,7 +2300,7 @@ function App() {
         // stays. It is visible in the composer, so they can send it, edit it or drop it.
         finishPlanTurnForSession(sessionId)
         patchSessionState(sessionId, {
-          working: false, liveText: '', toolActivity: [], turnOutcome: 'failed',
+          working: false, liveText: '', toolActivity: [], progress: null, turnOutcome: 'failed',
         })
         if (isSelected) showError(event.data?.message || 'The Copilot session reported an error.')
       }
@@ -2280,7 +2347,8 @@ function App() {
       if (!result.quota) setQuotaFailed(true)
       setCapabilities(result.capabilities)
       setKnowledge(result.capabilities?.knowledge || [])
-      setSelectedModel(result.models[0]?.id || 'auto')
+      modelsRef.current = result.models || []
+      setSelectedModel(defaultModelId(result.models))
       setReady(true)
 
       // First launch after this feature shipped: keep every session already on disk, so
@@ -2316,7 +2384,7 @@ function App() {
       unsubscribeMetadata()
       unsubscribeCommands()
     }
-  }, [api, beginPlanTurnForSession, createSession, finishPlanTurnForSession, markPlanChangedForSession, patchSessionState, showError])
+  }, [api, beginPlanTurnForSession, createSession, finishPlanTurnForSession, markPlanChangedForSession, patchSessionState, showError, streamBuffer])
 
   useEffect(() => {
     if (!ready || !api?.refreshQuota) return undefined
@@ -3115,6 +3183,7 @@ function App() {
   }
 
   const changeModel = async (model) => {
+    autoChosenRef.current = model === 'auto'
     setSelectedModel(model)
     if (!selectedId) return
     const result = await api.setModel({ sessionId: selectedId, model })
@@ -4082,25 +4151,7 @@ function App() {
               </div>
             )}
   
-            {messages.map((item) => (
-              <article className={`message ${item.role}`} key={item.id}>
-                {item.role !== 'user' && <div className="avatar copilot"><Sparkles size={15} /></div>}
-                <div>
-                  <div className="speaker">{item.role === 'user' ? 'You' : 'Copilot'}</div>
-                  {!!item.attachments?.length && (
-                    <div className="message-attachments">
-                      {item.attachments.map((attachment) => (
-                        <MessageAttachment item={attachment} key={attachment.path} />
-                      ))}
-                    </div>
-                  )}
-                  <MessageBody role={item.role} content={item.content} />
-                  {item.role === 'user' && (
-                    <MessageStatus status={item.status} attachmentCount={item.attachments?.length || 0} />
-                  )}
-                </div>
-              </article>
-            ))}
+            {messages.map((item) => <MessageRow item={item} key={item.id} />)}
   
             {(liveState.liveText || working) && (
               <article className="message assistant">
@@ -4118,6 +4169,11 @@ function App() {
                         {!!runningFor && <span className="thinking-clock">{runningFor}</span>}
                       </div>
                     )}
+                  {/* Most of a turn is spent waiting on the model, and "Working" alone gives no
+                      sign of what it is doing. This names it while the answer has not started. */}
+                  {!liveState.liveText && !!workingDetail && (
+                    <div className="thinking-detail" title={workingDetail}>{workingDetail}</div>
+                  )}
                   {!!liveState.toolActivity.length && (
                     <div className="tool-activity">
                       {liveState.toolActivity.map((tool) => (

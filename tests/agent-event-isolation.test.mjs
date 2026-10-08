@@ -7,6 +7,13 @@ import {
   isSubagentTranscriptEvent,
   subagentIdOf,
 } from '../shared/agent-events.mjs'
+import {
+  STREAM_DELTA_TYPES,
+  applySessionPatch,
+  applyStreamChunk,
+  createStreamBuffer,
+  toolArgumentDetail,
+} from '../src/live-stream.mjs'
 
 const appSource = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8')
 const mainSource = await readFile(new URL('../electron/main.mjs', import.meta.url), 'utf8')
@@ -221,16 +228,22 @@ async function loadLiveHandler() {
       drained: 0,
       state: { liveText: '', toolActivity: [], pendingTools: {}, backgroundAgents: [], ...initialState },
     }
-    const patchSessionState = (_id, patch) => {
-      const next = typeof patch === 'function' ? patch(scene.state) : patch
-      scene.state = { ...scene.state, ...next }
+    const patchSessionState = (id, patch) => {
+      scene.state = applySessionPatch({ [id]: scene.state }, id, patch, scene.state)[id]
     }
+    // The app releases streamed text once per frame. Here it is released at once, which keeps
+    // each run synchronous while still going through the real buffer.
+    const streamBuffer = createStreamBuffer({
+      schedule: (run) => { run(); return 0 },
+      cancel: () => {},
+      apply: (id, chunk) => patchSessionState(id, (current) => applyStreamChunk(current, chunk)),
+    })
     const handler = new Function(
       'sessionId', 'event', 'selectedIdRef', 'lastEventAtRef',
       'turnEndedAtRef', 'beginPlanTurnForSession', 'markPlanChangedForSession', 'setPlanRevision',
       'patchSessionState', 'setMessages', 'crypto',
       'finishPlanTurnForSession', 'drainQueueRef', 'quotaRefreshRef', 'showError',
-      'isMainConversationEvent',
+      'isMainConversationEvent', 'streamBuffer', 'STREAM_DELTA_TYPES', 'toolArgumentDetail',
       [contentSource, helperSource, foldSource, constantsSource, mergeMessageSource(), inner].join('\n'),
     )
     const turnEndedAtRef = { current: {} }
@@ -241,7 +254,7 @@ async function loadLiveHandler() {
         patchSessionState, (updater) => { scene.messages = updater(scene.messages) }, { randomUUID: () => 'generated' },
         () => {}, { current: () => { scene.drained += 1; return true } }, { current: () => {} },
         (message) => scene.errors.push(message),
-        isMainConversationEvent,
+        isMainConversationEvent, streamBuffer, STREAM_DELTA_TYPES, toolArgumentDetail,
       )
     }
     return scene
@@ -265,13 +278,15 @@ function loadSessionBusy() {
   const handlerSource = source.slice(start, end)
   return async (events) => {
     const build = new Function(
-      'resumeSession', 'serializeError', 'isMainConversationEvent',
+      'resumeSession', 'serializeError', 'isMainConversationEvent', 'liveBusy',
       `return ${handlerSource}`,
     )
+    // An empty live map: the session has not been seen live, so the transcript is what is read.
     const handler = build(
       async () => ({ getEvents: async () => events }),
       (error) => ({ message: String(error) }),
       isMainConversationEvent,
+      new Map(),
     )
     return handler(null, SESSION)
   }
