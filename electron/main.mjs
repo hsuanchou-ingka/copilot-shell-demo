@@ -167,10 +167,20 @@ function collectInstructionFiles(workingDirectory) {
   return files
 }
 
+// The runtime already compacts long chats on its own; these are its defaults pulled in a little.
+// Starting earlier leaves the background summary more room to finish before the chat has to stop
+// and wait for it, and saying it here means the behaviour no longer rests on an unstated default.
+const INFINITE_SESSIONS = Object.freeze({
+  enabled: true,
+  backgroundCompactionThreshold: 0.7,
+  bufferExhaustionThreshold: 0.9,
+})
+
 async function sharedSessionConfig() {
   return {
     customAgents: await loadClaudeAgents(),
     skillDirectories: SKILL_DIRECTORIES,
+    infiniteSessions: { ...INFINITE_SESSIONS },
   }
 }
 
@@ -365,6 +375,10 @@ const RENDERER_EVENT_TYPES = new Set([
   'session.todos_changed',
   'session.error',
   'session.idle',
+  // Compaction can take a while and the chat is quiet meanwhile, so the window says what is
+  // happening and reports what it freed once it is over.
+  'session.compaction_start',
+  'session.compaction_complete',
 ])
 // The window counts any event as proof that a session is alive, and says so when a turn goes
 // quiet for a long time. A long command or a model that streams nothing visible can produce
@@ -391,9 +405,18 @@ const BUSY_START_TYPES = new Set(['user.message', 'assistant.turn_start', 'model
 // left on after it would bring the spinner back the next time the chat is opened.
 const BUSY_END_TYPES = new Set(['assistant.idle', 'session.idle', 'session.error'])
 
+// Compacting makes a model call of its own, which announces itself with model.turn_started like
+// any turn but is never followed by an idle. Counted as a turn, it left a compacted chat marked
+// busy for good, so reopening it brought back a spinner and held every new message in the queue.
+const compactingSessions = new Set()
+
 function trackBusy(sessionId, event) {
   // A delegated agent starting and finishing its own turns says nothing about the main one.
   if (!isMainConversationEvent(event)) return
+  if (event.type === 'session.compaction_start') compactingSessions.add(sessionId)
+  else if (event.type === 'session.compaction_complete') compactingSessions.delete(sessionId)
+  // Only the model's own start is skipped. A message typed meanwhile is a real turn beginning.
+  else if (event.type === 'model.turn_started' && compactingSessions.has(sessionId)) return
   if (BUSY_START_TYPES.has(event.type)) liveBusy.set(sessionId, true)
   else if (BUSY_END_TYPES.has(event.type)) liveBusy.set(sessionId, false)
 }
@@ -409,6 +432,7 @@ function attachSession(session) {
   // A new handle means events may have gone unheard since the last one, after a reconnect for
   // instance, so whatever the stream last said about this session is no longer trusted.
   liveBusy.delete(session.sessionId)
+  compactingSessions.delete(session.sessionId)
 
   const unsubscribe = session.on((event) => {
     trackBusy(session.sessionId, event)
@@ -805,6 +829,76 @@ registerIpcHandle('copilot:session-stats', async (_event, sessionIds) => {
   }
 })
 
+// The token limits of each model, read once from the model list. The context read below needs
+// them, because without them the runtime measures against a default window that is not the
+// model's own. A failed read is forgotten so the next call tries again.
+let modelLimitsPromise
+
+function modelLimits(copilot) {
+  if (!modelLimitsPromise) {
+    modelLimitsPromise = copilot.listModels()
+      .then((models) => new Map(models.map((model) => [model.id, model.capabilities?.limits || {}])))
+      .catch((error) => {
+        modelLimitsPromise = undefined
+        throw error
+      })
+  }
+  return modelLimitsPromise
+}
+
+// How full the chat's context window is, for the meter in the header. The runtime counts it for
+// the model the chat is on; "auto" has no fixed limits, so it gets the runtime's own default.
+registerIpcHandle('copilot:session-context', async (_event, sessionId) => {
+  try {
+    const session = await resumeSession(sessionId)
+    const copilot = await getClient()
+    const current = await session.rpc.model.getCurrent()
+    const limits = current?.modelId
+      ? (await modelLimits(copilot).catch(() => new Map())).get(current.modelId) || {}
+      : {}
+    const promptTokenLimit = limits.max_prompt_tokens || 0
+    const outputTokenLimit = promptTokenLimit && limits.max_context_window_tokens > promptTokenLimit
+      ? limits.max_context_window_tokens - promptTokenLimit
+      : 0
+    const result = await session.rpc.metadata.contextInfo({
+      promptTokenLimit,
+      outputTokenLimit,
+      ...(current?.modelId ? { selectedModel: current.modelId } : {}),
+    })
+    const info = result?.contextInfo
+    // Null until the chat has built its first prompt, which the window shows as nothing at all.
+    if (!info) return { ok: true, used: null, limit: null, threshold: null }
+    return {
+      ok: true,
+      used: info.totalTokens,
+      limit: info.promptTokenLimit,
+      threshold: info.compactionThreshold,
+    }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+// Summarises the chat's history so far and replaces it with the summary, which frees room in the
+// context window. The transcript on disk keeps everything; only what the model sees shrinks.
+registerIpcHandle('copilot:compact-session', async (_event, sessionId) => {
+  try {
+    const session = await resumeSession(sessionId)
+    const result = await session.rpc.history.compact({ trigger: 'manual' })
+    if (!result?.success) {
+      return { ok: false, error: { message: 'Compacting this chat did not finish.' } }
+    }
+    return {
+      ok: true,
+      tokensRemoved: result.tokensRemoved || 0,
+      messagesRemoved: result.messagesRemoved || 0,
+      summary: result.summaryContent || '',
+    }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
 // The live event stream is what makes the UI feel immediate, but it is not a source of truth:
 // a dropped end-of-turn event used to leave the spinner running forever with no way back.
 // The transcript on disk is the truth, so this exists to go and ask.
@@ -1081,6 +1175,7 @@ registerIpcHandle('copilot:delete-session', async (_event, sessionId) => {
     }
     rejectPendingPermissionsForSession(sessionId)
     liveBusy.delete(sessionId)
+    compactingSessions.delete(sessionId)
     lastHeartbeatAt.delete(sessionId)
     const copilot = await getClient()
     await copilot.deleteSession(sessionId)

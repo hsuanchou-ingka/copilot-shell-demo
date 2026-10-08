@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import { compactionNotice } from '../src/session-size.mjs'
 import {
   isMainConversationEvent,
   isSubagentLifecycleEvent,
@@ -154,6 +155,60 @@ test('live delegated events never speak as the user, end the turn or drain the q
   assert.deepEqual(scene.errors, ['the session failed'])
 })
 
+test('compaction shows on the quiet line, reports once, and reads the meter again', async () => {
+  const run = await loadLiveHandler()
+
+  let scene = run([{ type: 'session.compaction_start', data: { trigger: 'threshold' } }])
+  assert.equal(scene.state.compacting, true)
+
+  scene = run([
+    { type: 'session.compaction_start', data: { trigger: 'threshold' } },
+    { type: 'session.compaction_complete', data: { trigger: 'threshold', success: true, messagesRemoved: 14, tokensRemoved: 52_000 } },
+  ])
+  assert.equal(scene.state.compacting, false)
+  assert.deepEqual(scene.notices, ['History compacted automatically: removed 14 messages, 52k tokens'])
+  assert.deepEqual(scene.contextReads, [SESSION])
+
+  // /compact typed into the composer is manual but was not started by the window's own call.
+  scene = run([{ type: 'session.compaction_complete', data: { trigger: 'manual', success: true, messagesRemoved: 2, tokensRemoved: 900 } }])
+  assert.deepEqual(scene.notices, ['Compacted: removed 2 messages, 900 tokens'])
+
+  // The window's own call reports its result itself, so the event stays silent.
+  scene = run(
+    [{ type: 'session.compaction_complete', data: { trigger: 'manual', success: true, messagesRemoved: 2, tokensRemoved: 900 } }],
+    {},
+    { manualCompactions: new Set([SESSION]) },
+  )
+  assert.deepEqual(scene.notices, [])
+  assert.deepEqual(scene.contextReads, [SESSION])
+
+  // The end of a turn reads the meter again; a delegated agent going idle does not.
+  scene = run([{ type: 'session.idle', agentId: CHILD, data: {} }, { type: 'session.idle', data: {} }], { working: true })
+  assert.deepEqual(scene.contextReads, [SESSION])
+})
+
+test('a compaction model call does not leave the chat marked busy', () => {
+  const source = sectionBetween(mainSource, 'const liveBusy = new Map()', '\nfunction attachSession')
+  const build = new Function('isMainConversationEvent', `${source}\nreturn { liveBusy, trackBusy }`)
+  const { liveBusy, trackBusy } = build(isMainConversationEvent)
+
+  // An idle chat compacted by hand: the model call inside it is not a turn.
+  trackBusy(SESSION, { type: 'session.idle', data: {} })
+  trackBusy(SESSION, { type: 'session.compaction_start', data: { trigger: 'manual' } })
+  trackBusy(SESSION, { type: 'model.turn_started', data: {} })
+  trackBusy(SESSION, { type: 'session.compaction_complete', data: { success: true } })
+  assert.equal(liveBusy.get(SESSION), false)
+
+  // A message typed while it runs is a real turn, and so is the next one afterwards.
+  trackBusy(SESSION, { type: 'session.compaction_start', data: {} })
+  trackBusy(SESSION, { type: 'user.message', data: { content: 'next' } })
+  assert.equal(liveBusy.get(SESSION), true)
+  trackBusy(SESSION, { type: 'session.compaction_complete', data: { success: true } })
+  trackBusy(SESSION, { type: 'session.idle', data: {} })
+  trackBusy(SESSION, { type: 'model.turn_started', data: {} })
+  assert.equal(liveBusy.get(SESSION), true)
+})
+
 test('the background panel still sees delegated work and its lifecycle', async () => {
   const run = await loadLiveHandler()
   const scene = run([
@@ -221,10 +276,12 @@ async function loadLiveHandler() {
   const constantsSource = sectionBetween(appSource, 'const TURN_END_EVENTS = new Set', '\n// A turn that has gone this long')
   const contentSource = sectionBetween(appSource, 'const SKILL_PREAMBLE_RE', '\nfunction mergeMessage')
 
-  return (events, initialState = {}) => {
+  return (events, initialState = {}, options = {}) => {
     const scene = {
       messages: [],
       errors: [],
+      notices: [],
+      contextReads: [],
       drained: 0,
       state: { liveText: '', toolActivity: [], pendingTools: {}, backgroundAgents: [], ...initialState },
     }
@@ -244,6 +301,7 @@ async function loadLiveHandler() {
       'patchSessionState', 'setMessages', 'crypto',
       'finishPlanTurnForSession', 'drainQueueRef', 'quotaRefreshRef', 'showError',
       'isMainConversationEvent', 'streamBuffer', 'STREAM_DELTA_TYPES', 'toolArgumentDetail',
+      'refreshContext', 'showNotice', 'manualCompactionsRef', 'compactionNotice',
       [contentSource, helperSource, foldSource, constantsSource, mergeMessageSource(), inner].join('\n'),
     )
     const turnEndedAtRef = { current: {} }
@@ -255,6 +313,8 @@ async function loadLiveHandler() {
         () => {}, { current: () => { scene.drained += 1; return true } }, { current: () => {} },
         (message) => scene.errors.push(message),
         isMainConversationEvent, streamBuffer, STREAM_DELTA_TYPES, toolArgumentDetail,
+        (id) => scene.contextReads.push(id), (message) => scene.notices.push(message),
+        { current: options.manualCompactions || new Set() }, compactionNotice,
       )
     }
     return scene

@@ -14,6 +14,7 @@ import {
 } from './live-stream.mjs'
 import { interruptTurn, prioritizeQueuedMessage } from './turn-interruption.mjs'
 import { REASON_LABELS, cleanupReasons, isAutoDeletable } from './session-cleanup.mjs'
+import { carryOverPrompt, compactionNotice, contextMeter, formatTokens, transcriptWarning } from './session-size.mjs'
 import {
   beginPlanTurn,
   createPlanLifecycleState,
@@ -79,6 +80,9 @@ const EMPTY_SESSION_STATE = {
   // What the model is doing before its answer starts: the tail of its reasoning, or the tool it
   // is about to run. Shown as one quiet line under "Working" and cleared once the answer streams.
   progress: null,
+  // Whether the runtime is summarising this chat's history right now, either because it was
+  // asked to or because the context window filled past its threshold.
+  compacting: false,
 }
 const EMPTY_QUEUE = []
 const EMPTY_TASKS = []
@@ -1448,6 +1452,12 @@ function App() {
   const [sessionStats, setSessionStats] = useState({})
   // The updatedAt each id was last asked about, so a chat is only read again once it has changed.
   const statsRequestedRef = useRef({})
+  // How full each chat's context window is, keyed by session id, for the meter in the header.
+  const [sessionContext, setSessionContext] = useState({})
+  // Sessions with a compaction this window asked for still running. Their result is reported
+  // when the call returns, so the event that also announces it is not reported a second time.
+  const manualCompactionsRef = useRef(new Set())
+  const [carryingOver, setCarryingOver] = useState(false)
   const [selectedProject, setSelectedProject] = useState(() => {
     const stored = loadValue(SELECTED_PROJECT_KEY, null)
     return isFolderKey(stored) ? stored : null
@@ -1714,7 +1724,13 @@ function App() {
   const selectedModelName = models.find((model) => model.id === selectedModel)?.name || 'Model'
   const liveState = sessionState[selectedId] || EMPTY_SESSION_STATE
   const working = liveState.working
-  const workingDetail = working ? progressLine(liveState.progress) : ''
+  const compacting = Boolean(liveState.compacting)
+  // Compacting says so on the same quiet line, since nothing else is going to explain the pause.
+  let workingDetail = working ? progressLine(liveState.progress) : ''
+  if (compacting) workingDetail = 'Compacting history'
+  const meter = contextMeter(selectedId ? sessionContext[selectedId] : null)
+  const selectedContext = selectedId ? sessionContext[selectedId] : null
+  const sizeWarning = selectedId ? transcriptWarning(sessionStats[selectedId]?.bytes) : null
   // A turn that has stopped producing events has stopped telling us anything, so after a while
   // the composer says how long it has been quiet instead of implying steady progress. Reading
   // tick here is what keeps the label counting up.
@@ -1728,7 +1744,7 @@ function App() {
     : ''
   // How long the finished turn took, so the end of the work is stated rather than left to be
   // inferred from a spinner that is no longer there. Absence is what made this ambiguous.
-  const settled = !working && liveState.turnStartedAt && liveState.turnEndedAt
+  const settled = !working && !compacting && liveState.turnStartedAt && liveState.turnEndedAt
     ? {
       // Only work that actually finished gets the settled green. A turn that was cut short or
       // fell over is over, which is the thing worth knowing, but it is not an accomplishment.
@@ -1923,8 +1939,27 @@ function App() {
 
   const showError = useCallback((text, options = {}) => {
     if (!text) return
-    setError({ message: text, persistent: options.persistent || isAuthErrorMessage(text) })
+    setError({
+      message: text,
+      persistent: options.persistent || isAuthErrorMessage(text),
+      tone: options.tone || 'error',
+    })
   }, [])
+
+  // Good news goes through the same banner, in a neutral tone, so there is still only one place
+  // the window speaks up and one thing to dismiss.
+  const showNotice = useCallback((text) => showError(text, { tone: 'info' }), [showError])
+
+  const refreshContext = useCallback((sessionId) => {
+    if (!api?.sessionContext || !sessionId) return
+    api.sessionContext(sessionId).then((result) => {
+      if (!result?.ok) return
+      setSessionContext((current) => ({
+        ...current,
+        [sessionId]: { used: result.used, limit: result.limit, threshold: result.threshold },
+      }))
+    }).catch(() => {})
+  }, [api])
 
   // Poll the detached shell logs for progress while background work is live. Only detached
   // shells write those logs, so probing anything else would read a missing file and look dead.
@@ -2265,6 +2300,24 @@ function App() {
       }
       streamBuffer.flush(sessionId)
 
+      if (event.type === 'session.compaction_start') {
+        patchSessionState(sessionId, { compacting: true })
+      }
+      if (event.type === 'session.compaction_complete') {
+        patchSessionState(sessionId, { compacting: false })
+        // A compaction started from this window reports its own result when the call returns.
+        // Everything else, including /compact typed into the composer, is reported from here.
+        if (isSelected && !manualCompactionsRef.current.has(sessionId)) {
+          const automatic = event.data?.trigger !== 'manual'
+          if (event.data?.success) showNotice(compactionNotice(event.data || {}, automatic))
+          else showError(event.data?.error || 'The chat history could not be compacted.')
+        }
+        if (isSelected) refreshContext(sessionId)
+      }
+      // The context window only changes when a turn adds to it, so the meter is read again once
+      // the turn is over rather than on every event.
+      if (event.type === 'session.idle' && isSelected) refreshContext(sessionId)
+
       // The answer has begun, so the line saying what the model was doing makes way for it.
       if (event.type === 'assistant.message_start') {
         patchSessionState(sessionId, { progress: null })
@@ -2429,7 +2482,7 @@ function App() {
       unsubscribeMetadata()
       unsubscribeCommands()
     }
-  }, [api, beginPlanTurnForSession, createSession, finishPlanTurnForSession, markPlanChangedForSession, patchSessionState, showError, streamBuffer])
+  }, [api, beginPlanTurnForSession, createSession, finishPlanTurnForSession, markPlanChangedForSession, patchSessionState, refreshContext, showError, showNotice, streamBuffer])
 
   useEffect(() => {
     if (!ready || !api?.refreshQuota) return undefined
@@ -2487,6 +2540,7 @@ function App() {
       // is newer than the transcript, so fold it back in rather than overwriting it.
       const history = messagesFromEvents(result.events)
       setMessages((live) => (live.length ? live.reduce(mergeMessage, history) : history))
+      refreshContext(selectedId)
       // Rebuild work that was already running before this session was opened.
       const activity = backgroundActivityFromEvents(result.events)
       patchSessionState(selectedId, activity)
@@ -2510,7 +2564,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [api, beginPlanTurnForSession, patchSessionState, selectedId, showError])
+  }, [api, beginPlanTurnForSession, patchSessionState, refreshContext, selectedId, showError])
 
   useEffect(() => {
     if (!restoredSelectionRef.current) return
@@ -3227,6 +3281,79 @@ function App() {
     setSelectedId(result.session.id)
   }
 
+  // Asks the runtime to summarise the chat's history. The quiet line under Working says so while
+  // it runs, and the meter is read again afterwards because that is the number this changes.
+  const compactHistory = async (sessionId) => {
+    if (!api?.compactSession || !sessionId) return null
+    manualCompactionsRef.current.add(sessionId)
+    patchSessionState(sessionId, { compacting: true })
+    let result
+    try {
+      result = await api.compactSession(sessionId)
+    } catch (error) {
+      result = { ok: false, error: { message: error?.message || String(error) } }
+    } finally {
+      manualCompactionsRef.current.delete(sessionId)
+      patchSessionState(sessionId, { compacting: false })
+      refreshContext(sessionId)
+    }
+    return result
+  }
+
+  const compactSelected = async () => {
+    const sessionId = selectedId
+    if (!sessionId || working || compacting) return
+    const result = await compactHistory(sessionId)
+    if (!result?.ok) {
+      showError(result?.error?.message || 'Could not compact this chat.')
+      return
+    }
+    if (selectedIdRef.current === sessionId) showNotice(compactionNotice(result))
+  }
+
+  // A chat whose transcript has grown huge stays slow to open however much its context is
+  // compacted, because the file on disk only grows. This carries its summary into a new chat in
+  // the same folder on the same model, and leaves the old one where it is.
+  const startFreshFromSummary = async () => {
+    const source = selected
+    if (!source || working || compacting || carryingOver) return
+    setCarryingOver(true)
+    try {
+      const result = await compactHistory(source.id)
+      if (!result?.ok) {
+        showError(result?.error?.message || 'Could not summarise this chat.')
+        return
+      }
+      const prompt = carryOverPrompt(result.summary)
+      if (!prompt) {
+        showError('The summary came back empty, so no new chat was started.')
+        return
+      }
+      const created = await api.createSession({
+        model: selectedModelRef.current,
+        workingDirectory: workingDirectoryOf(source),
+      })
+      if (!created?.ok) {
+        showError(created?.error?.message || 'Could not create a session.')
+        return
+      }
+      setError(null)
+      adoptSession(created.session.id)
+      setSessions((items) => [created.session, ...items])
+      const directory = workingDirectoryOf(created.session)
+      if (directory) setSelectedProject(directory)
+      setMessages([])
+      setLoadingSession(true)
+      resetScroll()
+      setSelectedId(created.session.id)
+      void deliverMessage(created.session.id, prompt, [])
+    } catch (error) {
+      showError(error?.message || String(error))
+    } finally {
+      setCarryingOver(false)
+    }
+  }
+
   const changeModel = async (model) => {
     autoChosenRef.current = model === 'auto'
     setSelectedModel(model)
@@ -3845,6 +3972,14 @@ function App() {
                         <button
                           type="button"
                           role="menuitem"
+                          disabled={working || compacting}
+                          onClick={() => { setSessionMenuOpen(false); void compactSelected() }}
+                        >
+                          Compact history
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
                           className="danger"
                           onClick={() => { setSessionMenuOpen(false); setSessionToDelete(selected) }}
                         >
@@ -3885,6 +4020,24 @@ function App() {
           </label>
 
           <div className="credit-visibility">
+            {/* How full the context window is. Hidden until the runtime has counted it, because a
+                made up zero would read as an empty chat rather than an unknown one. */}
+            {!!meter && (
+              <div
+                className="context-meter"
+                title={`Context: ${selectedContext.used.toLocaleString()} of ${selectedContext.limit.toLocaleString()} tokens.${
+                  Number.isFinite(selectedContext.threshold)
+                    ? ` Older history is summarised from about ${formatTokens(selectedContext.threshold)}.`
+                    : ''
+                }`}
+                aria-label={`Context used: ${meter.label} tokens`}
+              >
+                <span className="context-meter-label">{meter.label}</span>
+                <span className="context-meter-track" aria-hidden="true">
+                  <span className="context-meter-fill" style={{ width: `${(meter.fraction * 100).toFixed(1)}%` }} />
+                </span>
+              </div>
+            )}
             <button
               type="button"
               ref={creditsButtonRef}
@@ -3956,6 +4109,18 @@ function App() {
           </div>
         </header>
 
+        {selected && !!sizeWarning && (
+          <div className="transcript-warning">
+            <span>{sizeWarning}</span>
+            <button
+              type="button"
+              onClick={() => { void startFreshFromSummary() }}
+              disabled={working || compacting || carryingOver}
+            >
+              {carryingOver ? 'Starting a fresh chat...' : 'Start a fresh chat from a summary'}
+            </button>
+          </div>
+        )}
 
         {selected && (resources.length > 0 || railOpen) && (
           <div className={`resource-rail ${railOpen ? 'open' : ''}`}>
@@ -4146,8 +4311,8 @@ function App() {
         )}
 
         {error && (
-          <div className="error-banner">
-            <AlertTriangle size={14} />
+          <div className={`error-banner${error.tone === 'info' ? ' is-info' : ''}`}>
+            {error.tone === 'info' ? <Check size={14} /> : <AlertTriangle size={14} />}
             <span>{error.message}</span>
             <button onClick={() => setError(null)}><X size={13} /></button>
           </div>
@@ -4296,7 +4461,7 @@ function App() {
   
             {messages.map((item) => <MessageRow item={item} key={item.id} />)}
   
-            {(liveState.liveText || working) && (
+            {(liveState.liveText || working || compacting) && (
               <article className="message assistant">
                 <div className="avatar copilot"><Sparkles size={15} /></div>
                 <div>
