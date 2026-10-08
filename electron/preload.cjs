@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('copilot', {
   listTasks: (sessionId) => ipcRenderer.invoke('copilot:list-tasks', sessionId),
   readTodos: (sessionId) => ipcRenderer.invoke('copilot:read-todos', sessionId),
   sessionBusy: (sessionId) => ipcRenderer.invoke('copilot:session-busy', sessionId),
+  sessionStats: (sessionIds) => ipcRenderer.invoke('copilot:session-stats', sessionIds),
   invokeCommand: (options) => ipcRenderer.invoke('copilot:invoke-command', options),
   abortSession: (sessionId) => ipcRenderer.invoke('copilot:abort-session', sessionId),
   pickAttachments: () => ipcRenderer.invoke('copilot:pick-attachments'),

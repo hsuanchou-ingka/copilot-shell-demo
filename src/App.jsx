@@ -13,6 +13,7 @@ import {
   toolArgumentDetail,
 } from './live-stream.mjs'
 import { interruptTurn, prioritizeQueuedMessage } from './turn-interruption.mjs'
+import { REASON_LABELS, cleanupReasons, isAutoDeletable } from './session-cleanup.mjs'
 import {
   beginPlanTurn,
   createPlanLifecycleState,
@@ -1442,6 +1443,11 @@ function App() {
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [cleanupSelected, setCleanupSelected] = useState([])
   const [cleanupBusy, setCleanupBusy] = useState(null)
+  // How much each chat has been used, read from its transcript, keyed by session id. Only the
+  // cleanup rules look at it, so it fills in after the list rather than holding the list up.
+  const [sessionStats, setSessionStats] = useState({})
+  // The updatedAt each id was last asked about, so a chat is only read again once it has changed.
+  const statsRequestedRef = useRef({})
   const [selectedProject, setSelectedProject] = useState(() => {
     const stored = loadValue(SELECTED_PROJECT_KEY, null)
     return isFolderKey(stored) ? stored : null
@@ -2017,13 +2023,52 @@ function App() {
     () => scopedSessions.filter((session) => !isOwnedSession(session.id) && session.id !== selectedId).length,
     [isOwnedSession, scopedSessions, selectedId],
   )
-  // The open session is left out: deleting what you are reading is never what you meant.
-  const cleanupCandidates = useMemo(
-    () => scopedSessions
-      .filter((session) => !isOwnedSession(session.id) && session.id !== selectedId)
-      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)),
-    [isOwnedSession, scopedSessions, selectedId],
+  // Which chats have a turn running, as one string so streaming text does not count as a change.
+  const workingKey = useMemo(
+    () => Object.keys(sessionState).filter((id) => sessionState[id]?.working).sort().join(' '),
+    [sessionState],
   )
+
+  // Every chat in view that one of the cleanup rules applies to, with the reasons attached so the
+  // dialog can say why. The rules themselves leave out the open chat, pinned chats and any chat
+  // with a turn running: deleting what you are reading or waiting on is never what you meant.
+  const cleanupCandidates = useMemo(() => {
+    const now = Date.now()
+    const workingIds = new Set(workingKey.split(' ').filter(Boolean))
+    return scopedSessions
+      .map((session) => ({
+        ...session,
+        reasons: cleanupReasons(session, {
+          stats: sessionStats[session.id],
+          now,
+          pinned: pinnedSessionIds,
+          selectedId,
+          owned: isOwnedSession(session.id),
+          working: workingIds.has(session.id),
+        }),
+      }))
+      .filter((session) => session.reasons.length)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+  }, [isOwnedSession, pinnedSessionIds, scopedSessions, selectedId, sessionStats, workingKey])
+
+  // Ask for usage figures for the chats started here, in one call, and only for the ones that are
+  // new or have changed since they were last read. A failed call is forgotten so it is tried again.
+  useEffect(() => {
+    if (!ready || !api?.sessionStats) return
+    const wanted = scopedSessions.filter((session) => (
+      isOwnedSession(session.id) && statsRequestedRef.current[session.id] !== session.updatedAt
+    ))
+    if (!wanted.length) return
+    wanted.forEach((session) => { statsRequestedRef.current[session.id] = session.updatedAt })
+    const forget = () => wanted.forEach((session) => { delete statsRequestedRef.current[session.id] })
+    api.sessionStats(wanted.map((session) => session.id)).then((result) => {
+      if (!result?.ok) {
+        forget()
+        return
+      }
+      setSessionStats((current) => ({ ...current, ...result.stats }))
+    }, forget)
+  }, [api, isOwnedSession, ready, scopedSessions])
 
   const visibleSessions = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -3239,10 +3284,20 @@ function App() {
     }
   }, [isOwnedSession, resetScroll, selectedProject, sessions, writeQueue])
 
+  // Every delete goes through one line, whoever asked for it. The CLI session store is a single
+  // file and parallel deletes race each other into "session not found", and the quiet removal of
+  // empty chats below can now run while the cleanup dialog is deleting.
+  const deleteChainRef = useRef(Promise.resolve())
+  const deleteOneSession = useCallback((sessionId) => {
+    const next = deleteChainRef.current.then(() => api.deleteSession(sessionId))
+    deleteChainRef.current = next.catch(() => {})
+    return next
+  }, [api])
+
   const deleteSession = async () => {
     const sessionId = sessionToDelete?.id
     if (!sessionId) return
-    const result = await api.deleteSession(sessionId)
+    const result = await deleteOneSession(sessionId)
     if (!result.ok) {
       showError(result.error?.message || 'Could not delete the session.')
       return
@@ -3252,7 +3307,9 @@ function App() {
   }
 
   const runCleanup = async () => {
-    const ids = cleanupSelected.filter((id) => cleanupCandidates.some((session) => session.id === id))
+    const ids = cleanupSelected.filter((id) => (
+      cleanupCandidates.some((session) => session.id === id) && !autoDeletingRef.current.has(id)
+    ))
     if (!ids.length || cleanupBusy) return
     setCleanupBusy({ done: 0, total: ids.length })
     const removed = []
@@ -3260,7 +3317,7 @@ function App() {
     for (const id of ids) {
       // Sequential on purpose: the CLI session store is a single file and parallel
       // deletes race each other into "session not found".
-      const result = await api.deleteSession(id)
+      const result = await deleteOneSession(id)
       if (result.ok) removed.push(id)
       else failed.push(id)
       setCleanupBusy({ done: removed.length + failed.length, total: ids.length })
@@ -3273,6 +3330,88 @@ function App() {
       showError(`Deleted ${removed.length}, but ${failed.length} could not be removed.`)
     }
   }
+
+  // Chats nobody typed in are removed without asking: once on start, and whenever one is left
+  // behind by switching to another chat. Everything that could mean someone is using the chat
+  // keeps it: being the open chat, a turn running, a message queued, sent or still being sent from
+  // this window, or a draft in its composer. Usage is read again from disk just before deleting, so
+  // a figure from before the first message was sent can never be the reason a chat goes.
+  const autoDeletingRef = useRef(new Set())
+  const autoCleanupRunningRef = useRef(false)
+  const sessionStateRef = useRef(sessionState)
+  useEffect(() => {
+    sessionStateRef.current = sessionState
+  }, [sessionState])
+
+  const isInUse = useCallback((sessionId) => {
+    if (sessionId === selectedIdRef.current) return true
+    if (sessionStateRef.current[sessionId]?.working) return true
+    if (queuesRef.current[sessionId]?.length) return true
+    if (sentAtRef.current[sessionId] || deliveryCountRef.current[sessionId]) return true
+    const draft = draftsRef.current[sessionId]
+    return Boolean(draft?.message?.trim() || draft?.attachments?.length)
+  }, [])
+
+  const autoCleanupRef = useRef(null)
+  useEffect(() => {
+    autoCleanupRef.current = async (ids, justLeftId = null) => {
+      if (autoCleanupRunningRef.current || cleanupBusy || !api?.sessionStats) return
+      const pool = sessions.filter((session) => (
+        ids.includes(session.id) && isOwnedSession(session.id) && !isInUse(session.id)
+      ))
+      if (!pool.length) return
+      autoCleanupRunningRef.current = true
+      try {
+        const fresh = await api.sessionStats(pool.map((session) => session.id))
+        if (!fresh?.ok) return
+        setSessionStats((current) => ({ ...current, ...fresh.stats }))
+        const removed = []
+        for (const session of pool) {
+          // Checked again at the moment of deleting, since the person may have opened the chat or
+          // sent something in it while the figures were being read or the last delete ran.
+          const deletable = !isInUse(session.id) && isAutoDeletable(session, {
+            stats: fresh.stats?.[session.id],
+            now: Date.now(),
+            pinned: pinnedSessionIds,
+            selectedId: selectedIdRef.current,
+            owned: true,
+            working: Boolean(sessionStateRef.current[session.id]?.working),
+            justLeft: session.id === justLeftId,
+          })
+          if (!deletable) continue
+          autoDeletingRef.current.add(session.id)
+          let result
+          try {
+            result = await deleteOneSession(session.id)
+          } catch (error) {
+            result = { ok: false, error: { message: error?.message || String(error) } }
+          }
+          autoDeletingRef.current.delete(session.id)
+          if (result?.ok) removed.push(session.id)
+          else showError(`Could not remove an empty chat: ${result?.error?.message || 'unknown error'}`)
+        }
+        forgetSessions(removed)
+      } finally {
+        autoCleanupRunningRef.current = false
+      }
+    }
+  })
+
+  // On start, once the first usage figures are in.
+  const startupCleanupDoneRef = useRef(false)
+  useEffect(() => {
+    if (startupCleanupDoneRef.current || !Object.keys(sessionStats).length) return
+    startupCleanupDoneRef.current = true
+    void autoCleanupRef.current?.(Object.keys(sessionStats))
+  }, [sessionStats])
+
+  // On leaving a chat for another one.
+  const previousSelectedIdRef = useRef(selectedId)
+  useEffect(() => {
+    const left = previousSelectedIdRef.current
+    previousSelectedIdRef.current = selectedId
+    if (left && left !== selectedId) void autoCleanupRef.current?.([left], left)
+  }, [selectedId])
 
   const userTurnCount = useMemo(
     () => messages.filter((item) => item.role === 'user').length,
@@ -3586,11 +3725,15 @@ function App() {
               type="button"
               className="session-cleanup-button"
               onClick={() => {
-                setCleanupSelected(cleanupCandidates.map((session) => session.id))
+                // External and empty chats start ticked as before. A chat with something in it is
+                // listed but left for the person to tick, so one press of Delete never takes it.
+                setCleanupSelected(cleanupCandidates
+                  .filter((session) => session.reasons.includes('external') || session.reasons.includes('empty'))
+                  .map((session) => session.id))
                 setCleanupOpen(true)
               }}
-              title={`Delete ${cleanupCandidates.length} external session${cleanupCandidates.length > 1 ? 's' : ''} for good`}
-              aria-label="Clean up external sessions"
+              title={`Clean up ${cleanupCandidates.length} session${cleanupCandidates.length === 1 ? '' : 's'}`}
+              aria-label={`Clean up ${cleanupCandidates.length} session${cleanupCandidates.length === 1 ? '' : 's'}`}
             >
               <Trash2 size={10} />
             </button>
@@ -4554,10 +4697,10 @@ function App() {
         <div className="permission-backdrop">
           <div className="permission-dialog cleanup-dialog">
             <span className="permission-icon delete"><Trash2 size={18} /></span>
-            <h2>Clean up external sessions</h2>
+            <h2>Clean up sessions</h2>
             <p>
-              These were started outside this app, usually by the Copilot CLI in a terminal.
-              Deleting removes them from disk for every Copilot surface.
+              Sessions that look finished with: started outside this app, empty, a single message, or
+              untouched for 30 days. Deleting removes a session from disk for every Copilot surface.
             </p>
             <div className="cleanup-toolbar">
               <button
@@ -4587,6 +4730,7 @@ function App() {
                     ))}
                   />
                   <span className="cleanup-title">{aliases[session.id] || session.title}</span>
+                  <small>{session.reasons.map((reason) => REASON_LABELS[reason]).join(', ')}</small>
                   <small>{displayTime(session.updatedAt)}</small>
                 </label>
               ))}

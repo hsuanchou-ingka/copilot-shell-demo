@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { CopilotClient } from '@github/copilot-sdk'
 import { isMainConversationEvent } from '../shared/agent-events.mjs'
 import { dropDisconnectedClient, getReusableSession } from './client-cache.mjs'
+import { createSessionStatsReader } from './session-stats.mjs'
 import { isOwnAppPage, isTrustedRendererEvent, registerIpcHandle as registerSecureIpcHandle } from './security.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -19,6 +20,7 @@ const execFileAsync = promisify(execFile)
 const CLAUDE_AGENTS_DIRECTORY = path.join(app.getPath('home'), '.claude', 'agents')
 const SHARED_SKILLS_DIRECTORY = path.join(app.getPath('home'), '.agents', 'skills')
 const GLOBAL_INSTRUCTIONS_FILE = path.join(app.getPath('home'), '.copilot', 'copilot-instructions.md')
+const SESSION_STATE_DIRECTORY = path.join(app.getPath('home'), '.copilot', 'session-state')
 const PROJECT_INSTRUCTION_FILES = ['AGENTS.md', path.join('.github', 'copilot-instructions.md')]
 const SKILL_DIRECTORIES = [SHARED_SKILLS_DIRECTORY]
 const AGENT_MODEL_IDS = {
@@ -52,6 +54,7 @@ let currentLogin
 let saveBoundsTimer
 let reloadedAfterCrash = false
 const activeSessions = new Map()
+const readSessionStats = createSessionStatsReader(SESSION_STATE_DIRECTORY)
 const pendingPermissions = new Map()
 
 const WINDOW_STATE_FILE = path.join(app.getPath('userData'), 'window.json')
@@ -786,6 +789,17 @@ registerIpcHandle('copilot:send-message', async (_event, payload) => {
       ...(safeAttachments.length ? { attachments: safeAttachments } : {}),
     })
     return { ok: true, messageId }
+  } catch (error) {
+    return { ok: false, error: serializeError(error) }
+  }
+})
+
+// How much each chat has been used, for the cleanup rules. Read straight from the transcripts on
+// disk rather than by resuming each session, which would cost a round trip and attach a handle to
+// every chat in the list. The window asks after the list has arrived, so the list never waits.
+registerIpcHandle('copilot:session-stats', async (_event, sessionIds) => {
+  try {
+    return { ok: true, stats: await readSessionStats(sessionIds) }
   } catch (error) {
     return { ok: false, error: serializeError(error) }
   }
