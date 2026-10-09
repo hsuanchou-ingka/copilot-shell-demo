@@ -52,6 +52,8 @@ So I built the interface I wanted. Everything here exists because it solved one 
 
 ![The rail expanded to show a folder, a pull request, a Notion page, a Figma file and a local file](docs/screenshots/resources.png)
 
+**Links to things on your machine.** A link in a reply that points at a file or folder opens it in the app macOS would use, whether it is written as an absolute path, a `file://` URL, a `~` path or a path relative to the chat's folder. Spaces and non-Latin names are handled, and a link that points at nothing says which path it looked for. The browser demo has no disk access, so there it says so instead of pretending the file opened.
+
 **Artifact previews.** Generated markup renders beside the conversation at desktop, tablet or phone width.
 
 ![An HTML swatch sheet rendering in the preview panel](docs/screenshots/artifact.png)

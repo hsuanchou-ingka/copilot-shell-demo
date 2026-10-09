@@ -1,5 +1,5 @@
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { isMainConversationEvent } from '../shared/agent-events.mjs'
 import { createQuotaRefresher } from './quota-refresh.mjs'
@@ -933,25 +933,49 @@ function withHardBreaks(text) {
   return String(text).replace(/([^\n])\n(?!\n)/g, '$1  \n')
 }
 
-function openExternalLink(event, href) {
-  event.preventDefault()
+function reportLinkFailure(message) {
+  window.dispatchEvent(new CustomEvent('copilot:external-error', {
+    detail: message || 'Could not open that link.',
+  }))
+}
+
+// One route for every link on screen: markdown prose, tool output and the file chips. The main
+// process decides what the href means, because it is the only side that can look at the disk.
+function openLink(href, workingDirectory = '') {
   if (!href) return
-  Promise.resolve(window.copilot?.openExternal(href)).then((result) => {
-    if (result && !result.ok) {
-      window.dispatchEvent(new CustomEvent('copilot:external-error', {
-        detail: result.error?.message || 'Could not open that link.',
-      }))
+  const bridge = window.copilot
+  const request = bridge?.openLink
+    ? bridge.openLink({ href, workingDirectory })
+    : bridge?.openExternal?.(href)
+  Promise.resolve(request).then((result) => {
+    if (result && !result.ok && !result.canceled) {
+      reportLinkFailure(result.error?.message)
     }
-  }).catch((error) => {
-    window.dispatchEvent(new CustomEvent('copilot:external-error', {
-      detail: error?.message || String(error),
-    }))
-  })
+  }).catch((error) => reportLinkFailure(error?.message || String(error)))
+}
+
+function openLinkFromEvent(event, href, workingDirectory) {
+  // An in-page jump is the browser's own business and was never broken.
+  if (typeof href === 'string' && href.startsWith('#')) return
+  event.preventDefault()
+  openLink(href, workingDirectory)
+}
+
+// react-markdown blanks any href it does not consider safe, which quietly included file: URLs and
+// left those links dead before a click could even be handled. The default transform still runs,
+// so javascript: and data: stay blocked; only file: is handed back.
+function markdownUrlTransform(url, key, node) {
+  const safe = defaultUrlTransform(url, key, node)
+  if (safe) return safe
+  return /^file:\/\//i.test(String(url || '')) ? url : safe
 }
 
 const RUNNABLE_LANGUAGES = new Set(['bash', 'sh', 'shell', 'zsh', 'console', 'terminal'])
 const RunCommandContext = createContext(null)
 const PreviewContext = createContext(null)
+// The folder a chat is working in. A relative link in a transcript means a file inside that
+// folder, never a file next to the app's own page.
+const LinkFolderContext = createContext('')
 
 const PREVIEW_DEVICES = [
   { id: 'desktop', label: 'Desktop', width: null },
@@ -1103,10 +1127,17 @@ function MarkdownPre({ children }) {
   return <CodeBlock language={language} code={code} />
 }
 
+function MarkdownLink({ href, children, ...rest }) {
+  const workingDirectory = useContext(LinkFolderContext)
+  return (
+    <a {...rest} href={href} onClick={(event) => openLinkFromEvent(event, href, workingDirectory)}>
+      {children}
+    </a>
+  )
+}
+
 const markdownComponents = {
-  a: ({ href, children, ...rest }) => (
-    <a {...rest} href={href} onClick={(event) => openExternalLink(event, href)}>{children}</a>
-  ),
+  a: MarkdownLink,
   pre: MarkdownPre,
   table: ({ children, ...rest }) => (
     <div className="markdown-table"><table {...rest}>{children}</table></div>
@@ -1121,7 +1152,11 @@ const MessageBody = memo(function MessageBody({ role, content }) {
   const source = role === 'user' ? withHardBreaks(content) : content
   return (
     <div className="markdown">
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        urlTransform={markdownUrlTransform}
+        components={markdownComponents}
+      >
         {source}
       </ReactMarkdown>
     </div>
@@ -1241,7 +1276,13 @@ function ArtifactPanel({ artifact, onClose, onError }) {
       if (event.data?.source !== 'hc-preview') return
       if (event.source !== frameRef.current?.contentWindow) return
       if (event.data.type === 'error') setRuntimeError(String(event.data.message || 'Script error'))
-      if (event.data.type === 'navigate') window.copilot?.openExternal(event.data.href)
+      // Preview content is untrusted markup, so it stays on the web only route. The refusal is
+      // now reported rather than dropped, so a dead click explains itself.
+      if (event.data.type === 'navigate') {
+        Promise.resolve(window.copilot?.openExternal(event.data.href)).then((result) => {
+          if (result && !result.ok) reportLinkFailure(result.error?.message)
+        }).catch((error) => reportLinkFailure(error?.message || String(error)))
+      }
       // A preview taller than the panel has to grow the frame, otherwise the iframe keeps its
       // own scrollbar and the bottom of the document is simply lost.
       if (event.data.type === 'size') {
@@ -3002,13 +3043,12 @@ function App() {
   }
 
   const openResource = (item) => {
-    if (item.kind === 'folder' || item.kind === 'file') {
-      Promise.resolve(api.openPath(item.value)).then((result) => {
-        if (!result?.ok) showError(`Could not open ${item.value}`)
-      }).catch((error) => showError(error?.message || `Could not open ${item.value}`))
-      return
-    }
-    Promise.resolve(api.openExternal(item.value)).then((result) => {
+    // Folders, files and web links all take the same route now, so a chip reports the same clear
+    // reason a link in the transcript would.
+    Promise.resolve(api.openLink
+      ? api.openLink({ href: item.value, workingDirectory: selectedWorkingDirectory })
+      : api.openExternal(item.value),
+    ).then((result) => {
       if (result && !result.ok) showError(result.error?.message || `Could not open ${item.value}`)
     }).catch((error) => showError(error?.message || `Could not open ${item.value}`))
   }
@@ -3917,6 +3957,7 @@ function App() {
       <section className="workspace">
        <RunCommandContext.Provider value={runCommandFromBlock}>
         <PreviewContext.Provider value={openPreview}>
+        <LinkFolderContext.Provider value={selectedWorkingDirectory}>
         <header className="topbar">
           <div className="session-title">
             <span className="session-title-icon"><TerminalSquare size={13} /></span>
@@ -4281,7 +4322,7 @@ function App() {
               {(railMenu.item.kind === 'folder' || railMenu.item.kind === 'file') && (
                 <button type="button" onClick={() => {
                   Promise.resolve(api.revealPath(railMenu.item.value)).then((result) => {
-                    if (!result?.ok) showError(`Could not reveal ${railMenu.item.value}`)
+                    if (!result?.ok) showError(result?.error?.message || `Could not reveal ${railMenu.item.value}`)
                   }).catch((error) => showError(error?.message || `Could not reveal ${railMenu.item.value}`))
                   setRailMenu(null)
                 }}>
@@ -4731,6 +4772,7 @@ function App() {
             </div>
           </div>
         )}
+        </LinkFolderContext.Provider>
         </PreviewContext.Provider>
        </RunCommandContext.Provider>
       </section>

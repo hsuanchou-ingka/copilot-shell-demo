@@ -78,10 +78,10 @@ test('collectResources preserves bare and quoted Unicode local paths', () => {
 })
 
 test('external open failures are dispatched to the existing error banner', async () => {
-  const opener = sectionBetween('function openExternalLink', 'const RUNNABLE_LANGUAGES')
+  const opener = sectionBetween('function reportLinkFailure', 'const RUNNABLE_LANGUAGES')
   const dispatched = []
   const window = {
-    copilot: { openExternal: async () => ({ ok: false, error: { message: 'blocked' } }) },
+    copilot: { openLink: async () => ({ ok: false, error: { message: 'blocked' } }) },
     dispatchEvent: (event) => dispatched.push(event),
   }
   const CustomEvent = class {
@@ -90,9 +90,12 @@ test('external open failures are dispatched to the existing error banner', async
       this.detail = init.detail
     }
   }
-  const openExternalLink = new Function('window', 'CustomEvent', opener + '; return openExternalLink')(window, CustomEvent)
+  const openLinkFromEvent = new Function(
+    'window', 'CustomEvent', 'defaultUrlTransform',
+    opener + '; return openLinkFromEvent',
+  )(window, CustomEvent, (value) => value)
   const event = { preventDefault() {} }
-  openExternalLink(event, 'https://example.com')
+  openLinkFromEvent(event, 'https://example.com', '')
   await new Promise((resolve) => setImmediate(resolve))
   assert.deepEqual(dispatched.map((item) => [item.type, item.detail]), [['copilot:external-error', 'blocked']])
 })

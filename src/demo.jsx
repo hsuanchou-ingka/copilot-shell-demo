@@ -2,6 +2,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
 import DemoTour from './demo-tour.jsx'
+import { classifyLinkTarget } from '../shared/link-targets.mjs'
 
 // A standalone harness that renders the real interface against fabricated data.
 // It backs both the README screenshots and the public web demo on GitHub Pages.
@@ -104,6 +105,7 @@ let ask = null
 
 const noop = () => () => {}
 const ok = (extra = {}) => Promise.resolve({ ok: true, ...extra })
+const DEMO_LOCAL_LINK_MESSAGE = 'This is the browser demo, so files on your machine cannot be opened here. Web links still work.'
 
 // Background agents come from the runtime task registry, so scenes set this to stage them.
 let mockTasks = []
@@ -147,9 +149,29 @@ window.copilot = {
   getPathForFile: () => '',
   setModel: () => ok(),
   deleteSession: () => ok(),
-  openExternal: () => ok(),
-  openPath: () => ok(),
-  revealPath: () => ok(),
+  openExternal: (url) => {
+    if (/^https?:\/\//i.test(String(url || ''))) {
+      window.open(url, '_blank', 'noopener')
+      return ok()
+    }
+    return Promise.resolve({ ok: false, error: { message: DEMO_LOCAL_LINK_MESSAGE } })
+  },
+  // The demo runs in a browser tab with no disk access. Pretending a local file opened left the
+  // click looking successful while nothing happened, so it says plainly that it cannot.
+  openLink: ({ href } = {}) => {
+    const target = classifyLinkTarget(href)
+    if (target.kind === 'external' && /^https?:/i.test(target.url)) {
+      window.open(target.url, '_blank', 'noopener')
+      return ok()
+    }
+    if (target.kind === 'anchor' || target.kind === 'empty') return ok()
+    if (target.kind === 'blocked') {
+      return Promise.resolve({ ok: false, error: { message: target.message } })
+    }
+    return Promise.resolve({ ok: false, error: { message: DEMO_LOCAL_LINK_MESSAGE } })
+  },
+  openPath: () => Promise.resolve({ ok: false, error: { message: DEMO_LOCAL_LINK_MESSAGE } }),
+  revealPath: () => Promise.resolve({ ok: false, error: { message: DEMO_LOCAL_LINK_MESSAGE } }),
   openGitHub: () => ok(),
   answerPermission: () => {},
   onEvent: (handler) => {

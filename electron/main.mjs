@@ -11,6 +11,7 @@ import { isMainConversationEvent } from '../shared/agent-events.mjs'
 import { dropDisconnectedClient, getReusableSession } from './client-cache.mjs'
 import { createSessionStatsReader } from './session-stats.mjs'
 import { isOwnAppPage, isTrustedRendererEvent, registerIpcHandle as registerSecureIpcHandle } from './security.mjs'
+import { openLinkTarget } from './open-link.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isDev = !app.isPackaged
@@ -1202,6 +1203,18 @@ registerIpcHandle('app:open-external', async (_event, url) => {
     appendLog(`could not open external link: ${error?.message || String(error)}`)
     return { ok: false, error: serializeError(error) }
   }
+})
+
+// Anything clicked inside a transcript comes here, because the renderer cannot tell a web link
+// from a file on disk without guessing, and guessing is what turned every local link into
+// "Invalid URL". The session folder travels with the click so a relative path resolves against
+// the chat it was written in rather than against the app's own page.
+registerIpcHandle('app:open-link', async (_event, payload) => {
+  const result = await openLinkTarget(payload, shell)
+  if (!result.ok && result.error?.message) {
+    appendLog(`could not open link ${payload?.href}: ${result.error.message}`)
+  }
+  return result
 })
 
 // A preview cannot be deleted once it is handed to the browser, which may not have opened it
