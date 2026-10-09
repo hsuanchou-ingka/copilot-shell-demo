@@ -123,6 +123,19 @@ test('a local link that points nowhere names the path instead of saying Invalid 
   assert.doesNotMatch(result.error.message, /Invalid URL/)
 })
 
+test('a permission error is surfaced, not folded into the missing-file message', async () => {
+  const denied = Object.assign(new Error('permission denied'), { code: 'EACCES' })
+  const result = await openLinkTarget(
+    { href: '/Users/hsuan.chou/private/secret.md' },
+    { openPath: async () => '', openExternal: async () => {} },
+    { statFile: async () => { throw denied } },
+  )
+  assert.equal(result.ok, false)
+  assert.match(result.error.message, /permission denied/)
+  assert.match(result.error.message, /\/Users\/hsuan\.chou\/private\/secret\.md/)
+  assert.doesNotMatch(result.error.message, /no file at/, 'a real error must not read as "missing"')
+})
+
 test('a local link never reports success when nothing was opened', async () => {
   let calls = 0
   const result = await openLinkTarget(
