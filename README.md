@@ -81,9 +81,9 @@ You need macOS on Apple Silicon, and the GitHub CLI (`gh`) installed and logged 
 - **Multiple `gh` accounts:** the app uses the active one. Run `gh auth switch` to pick the account with Copilot access, then reopen the app.
 - Logs are at `~/Library/Application Support/HC Copilot/app.log`.
 
-## Browser connection (retired, off by default)
+## Browser connection
 
-**Status:** this integration is retired and ships disabled. Keep it off unless you deliberately want it back. In extension mode every Copilot client that starts the server opens the extension connection page and attaches the Chrome debugger, so a normal day with several app sessions and CLI runs produces repeated connection pages and a persistent "Playwright Extension started debugging" banner. If you register the server, set `"enabled": false` as shown below and flip it on only for the session where you need it.
+**About the connection page:** in extension mode each MCP server process opens one extension connection page and attaches the Chrome debugger, so the "Playwright Extension started debugging" banner stays visible while the connection is live. With the default local server entry, every client that starts the server gets its own process, so several app sessions and CLI runs produce one connection page each. The page is not a stray dialog you can simply close: when the server passes the Keychain token, the connection page itself becomes the tab the assistant controls, and the first navigation turns it into the page you asked for. Closing it while it is the only connected tab ends the connection, and the server answers by opening a fresh connection page. To get a single page instead of one per client, run one shared server as described in [One connection page for every client](#one-connection-page-for-every-client).
 
 Sometimes the thing you want help with is already open in your browser: a page you are reading, a prototype you are reviewing, or a form you need to fill in. Rather than copying everything into the chat or signing in again in a separate browser, you can connect HC Copilot to that tab and tell it what to do.
 
@@ -132,13 +132,13 @@ security add-generic-password -U \
       "command": "/Users/YOUR_USERNAME/.copilot/bin/playwright-mcp",
       "args": [],
       "tools": ["*"],
-      "enabled": false
+      "enabled": true
     }
   }
 }
 ```
 
-`"enabled": false` keeps the entry registered but stops every client from launching it, which is the recommended default. Change it to `true` only while you need the connection, and set it back afterwards.
+`"enabled"` controls whether clients launch this server at all. Leave it `true` to keep the browser tools available; set it to `false` if you want the entry registered but dormant.
 
 **4. Reload the connection.** Exit and restart Copilot CLI, or fully quit HC Copilot with **Command + Q** and reopen it. This lets its runtime load the changed configuration. Allow Keychain access if macOS prompts.
 
@@ -164,11 +164,49 @@ The launcher retrieves the token from Keychain and passes it only through the MC
 
 **Troubleshooting:** If only Welcome appears, select an ordinary web page in the connection page or add it to the correct client's tab group. If authentication fails, ensure the extension and Keychain token belong to the same Chrome profile; update the Keychain entry if the token changes. The browser demo cannot access your local Keychain or browser tabs.
 
+### One connection page for every client
+
+By default each client starts its own copy of the server, and each copy opens its own connection page. You can instead run one shared server that every client connects to over HTTP, so the browser is opened once and reused.
+
+**1. Write a server config file**, for example `~/.copilot/playwright-shared.json`:
+
+```json
+{
+  "extension": true,
+  "sharedBrowserContext": true,
+  "server": { "port": 8931, "host": "localhost" }
+}
+```
+
+**2. Start the shared server** in a terminal and leave it running:
+
+```bash
+PLAYWRIGHT_MCP_CONFIG="$HOME/.copilot/playwright-shared.json" ~/.copilot/bin/playwright-mcp
+```
+
+**3. Point the clients at it** by replacing the `playwright` entry in `~/.copilot/mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "http",
+      "url": "http://localhost:8931/mcp",
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Use `localhost` in the URL. The server checks the `Host` header and answers `Access is only allowed at localhost:8931` if you write `127.0.0.1` instead.
+
+The first client to connect opens one connection page, which becomes the tab it works in. Later clients reuse the same browser and the same tab, and no further connection pages appear. Two limits are worth knowing: the shared browser closes when the last client disconnects, so the next client after that opens a fresh connection page, and all clients share one tab group rather than getting a group each. The `PLAYWRIGHT_MCP_SHARED_BROWSER_CONTEXT` environment variable listed in the Playwright MCP documentation has no effect in version 0.0.83, which is why the setting goes in the config file.
+
 ### Turn it off again
 
 1. Set `"enabled": false` on the `playwright` entry in `~/.copilot/mcp-config.json`. Leave every other server untouched.
 2. Quit HC Copilot with **Command + Q** and exit any running Copilot CLI session. Configuration changes apply to clients started afterwards, so sessions that are already connected keep their server until they end.
-3. Connection pages left over from earlier sessions can be closed like any other tab. Removing the Chrome extension and the Keychain entry is optional; with the server disabled the extension stays dormant and nothing connects to it.
+3. Connection pages left over from earlier sessions can be closed like any other tab once their server has stopped. While a server is still connected, closing its connection page ends that connection and the server opens a replacement page, so stop the client first. Removing the Chrome extension and the Keychain entry is optional; with the server disabled the extension stays dormant and nothing connects to it.
 
 ## Run from source
 
