@@ -81,7 +81,9 @@ You need macOS on Apple Silicon, and the GitHub CLI (`gh`) installed and logged 
 - **Multiple `gh` accounts:** the app uses the active one. Run `gh auth switch` to pick the account with Copilot access, then reopen the app.
 - Logs are at `~/Library/Application Support/HC Copilot/app.log`.
 
-## Browser connection
+## Browser connection (retired, off by default)
+
+**Status:** this integration is retired and ships disabled. Keep it off unless you deliberately want it back. In extension mode every Copilot client that starts the server opens the extension connection page and attaches the Chrome debugger, so a normal day with several app sessions and CLI runs produces repeated connection pages and a persistent "Playwright Extension started debugging" banner. If you register the server, set `"enabled": false` as shown below and flip it on only for the session where you need it.
 
 Sometimes the thing you want help with is already open in your browser: a page you are reading, a prototype you are reviewing, or a form you need to fill in. Rather than copying everything into the chat or signing in again in a separate browser, you can connect HC Copilot to that tab and tell it what to do.
 
@@ -129,11 +131,14 @@ security add-generic-password -U \
       "type": "local",
       "command": "/Users/YOUR_USERNAME/.copilot/bin/playwright-mcp",
       "args": [],
-      "tools": ["*"]
+      "tools": ["*"],
+      "enabled": false
     }
   }
 }
 ```
+
+`"enabled": false` keeps the entry registered but stops every client from launching it, which is the recommended default. Change it to `true` only while you need the connection, and set it back afterwards.
 
 **4. Reload the connection.** Exit and restart Copilot CLI, or fully quit HC Copilot with **Command + Q** and reopen it. This lets its runtime load the changed configuration. Allow Keychain access if macOS prompts.
 
@@ -158,6 +163,12 @@ A successful connection showing only the extension's **Welcome** page does not m
 The launcher retrieves the token from Keychain and passes it only through the MCP process environment. Missing, locked, or empty credentials stop the launcher with an explicit error. This bypasses the extension's connection approval dialog, not the assistant's tool permissions or website confirmations. Browser content exposed to the assistant becomes part of its model context; do not grant access to sensitive pages you do not intend to share. Review actions that submit forms, send messages, or change account settings.
 
 **Troubleshooting:** If only Welcome appears, select an ordinary web page in the connection page or add it to the correct client's tab group. If authentication fails, ensure the extension and Keychain token belong to the same Chrome profile; update the Keychain entry if the token changes. The browser demo cannot access your local Keychain or browser tabs.
+
+### Turn it off again
+
+1. Set `"enabled": false` on the `playwright` entry in `~/.copilot/mcp-config.json`. Leave every other server untouched.
+2. Quit HC Copilot with **Command + Q** and exit any running Copilot CLI session. Configuration changes apply to clients started afterwards, so sessions that are already connected keep their server until they end.
+3. Connection pages left over from earlier sessions can be closed like any other tab. Removing the Chrome extension and the Keychain entry is optional; with the server disabled the extension stays dormant and nothing connects to it.
 
 ## Run from source
 
